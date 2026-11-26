@@ -366,6 +366,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // A raw copy's kept write-watch asking must not outlive the
+            // allocation: the address may be other memory's once it is free.
+            let _changing = victory_gpu::title_memory_remapping();
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1985,7 +1988,8 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
-    // Splitting and joining placeholders changes nothing they show.
+    // Returning a private allocation to its placeholder can remove live pages.
+    let _changing = victory_gpu::title_memory_remapping();
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
         victory_gpu::title_memory_freed(address as usize, size);
     }
