@@ -2479,18 +2479,17 @@ enum Step {
     /// the card could bring the bytes instead.
     Fill(usize, usize, usize, Option<card_steps::FillTo>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a title copy intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// A submission-time title copy whose placed route did not apply.
+    RawCopy { dst: usize, src: usize, len: usize },
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a title copy intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
     /// A sparse upload consumes the staging buffer's held-mip mask in the
     /// next step. Complete this refresh before that metadata is read.
@@ -3265,7 +3264,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::RawCopy { .. } => return Some(WHY_RUN),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
@@ -3362,9 +3361,9 @@ fn joins_asked() -> (usize, usize) {
 /// Whether the part `next` can be prepared together with `ahead`, which goes
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
-/// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
+/// changes no title memory that they read ([`Step::Copy`], [`Step::RawCopy`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::RawCopy { .. }))) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -7605,17 +7604,19 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+    /// Records a raw title-memory copy in the order of the list's steps.
+    pub(crate) fn defer_raw_copy(&self, dst: usize, src: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::RawCopy { dst, src, len });
         deferred.title_written();
         drop(deferred);
         self.changed_something();
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Runs work that writes only host memory when the list is submitted.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
     }
@@ -7734,22 +7735,28 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                &Step::RawCopy { dst, src, len } => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
-                        // (It may write anywhere, a heap's records too.)
-                        crate::port_journal::prep_wrote();
+                    batch.title_written();
+                    // The destination can alias a heap's descriptor records.
+                    crate::port_journal::prep_wrote();
+                    let _step = crate::timeline::span("a step of ours");
+                    copy_raw_title(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::Host(work, _) => {
+                    batch.fill();
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     let _step = crate::timeline::span("a step of ours");
                     work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
-                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -8672,7 +8679,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) if taken(list, i) => Touch::Nothing,
-                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    Step::Copy(..) | Step::RawCopy { .. } | Step::Placed(_) => break 'steps,
                     _ => Touch::Nothing,
                 });
             }
@@ -8837,6 +8844,27 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Performs a raw copy only when both spans are mapped. An exact private
+/// write can be noted without ending the standing write-watch query.
+fn copy_raw_title(dst: usize, src: usize, len: usize) {
+    let reading = if len <= crate::watch::RAW_COPY_WATCH_LIMIT {
+        crate::watch::title_memory_reading_now()
+    } else {
+        None
+    };
+    let note = reading.as_ref().and_then(|reading| crate::watch::prepare_raw_copy_note(reading, dst, len));
+    let reading = reading.filter(|_| note.is_some());
+    if crate::texture::committed(src as *const u8, len) && crate::texture::committed(dst as *const u8, len) {
+        // SAFETY: the raw title copy accepts overlapping mapped spans.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+        if let (Some(note), Some(reading)) = (note, reading)
+            && note.written(&reading) {
+            return;
+        }
+    }
+    crate::watch::ask_once_end();
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -10627,6 +10655,7 @@ mod refresh_tests {
     /// title memory holds.
     #[test]
     fn refreshed_ranges_hold_title_memory() {
+        let _one = crate::watch::one_asking_test();
         // SAFETY (all blocks): title memory and copies of the test's own,
         // written by this thread and, in `Batch::flush`, by the threads that
         // refresh, which are done when it returns.
@@ -10748,6 +10777,7 @@ mod refresh_tests {
     /// `VICTORY_TEST_ROUNDS`, if what is landed is noted before it is in.)
     #[test]
     fn landings_title_writes_and_light_refreshes_at_once() {
+        let _one = crate::watch::one_asking_test();
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         assert!(crate::safecopy::on());
         const LEN: usize = 24 * PAGE;
@@ -10975,6 +11005,7 @@ mod refresh_tests {
     /// is so no more once something wrote it.
     #[test]
     fn unchanged_ranges_are_known() {
+        let _one = crate::watch::one_asking_test();
         for view in [false, true] {
             let region = title(8 * PAGE, view);
             // (A page read for the first time counts as written.)
@@ -11066,6 +11097,7 @@ mod refresh_tests {
     #[test]
     #[ignore]
     fn frame_of_refreshes() {
+        let _one = crate::watch::one_asking_test();
         let mut random = Random(0x9876_5432_1234_5671);
         const EACH: usize = 224 << 10;
         const BIG: usize = 174 << 20;
