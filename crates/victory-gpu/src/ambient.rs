@@ -118,8 +118,10 @@ fn air() -> f32 {
     })
 }
 
-/// LOCAL: how many times the estimate the title's own result may keep
-/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset).
+/// How many times the estimate the title's own result may keep
+/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset). Without rays the
+/// probes hold the sky's light indoors too; at 4 times the estimate a room
+/// looked towards a window or the sky goes very bright.
 fn most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -259,6 +261,9 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // A NaN or infinity in the air is summed along every view ray through
+    // it: black or white patches floating in the room (tested as in `keep`).
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
