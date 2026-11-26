@@ -2915,6 +2915,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -3141,7 +3142,7 @@ fn blame_stale(stale: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) 
 /// title memory read, took `us`.
 #[cfg(feature = "diagnostics")]
 fn blamed(why: usize, us: u64) {
-    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (named, refused) = std::mem::take(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()));
     let (key, at) = match (why, named) {
         (WHY_READ | WHY_STALE, Some(named)) => named,
         (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
@@ -7401,6 +7402,7 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    #[allow(dead_code)]
     pub(crate) fn budget(&self) -> Option<u64> {
         self.budget_resource().map(|(_, va)| va)
     }
@@ -8295,6 +8297,7 @@ mod front_tests {
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
+#[allow(dead_code)]
 enum Touch {
     /// A refresh of a copy (by address), from, to.
     Refresh(usize, usize, usize),
