@@ -1407,6 +1407,7 @@ impl Drop for Held {
 /// Holds title texture `this` alive, for work on a thread the title knows
 /// nothing of. `None` if it is no texture, or is being released.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn hold(this: This) -> Option<Held> {
     // A texture leaves the table before it is freed, under this lock.
     let all = textures();
