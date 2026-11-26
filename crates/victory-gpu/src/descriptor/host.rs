@@ -179,9 +179,9 @@ impl RemapTable {
         let base = crate::frame::current();
         #[cfg(test)]
         {
-            return base.saturating_add(
+            base.saturating_add(
                 self.test_frame_offset.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            )
         }
         #[cfg(not(test))]
         base
@@ -1380,8 +1380,14 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
-            format!("dynamic slot {} (taken {taken:?})", index - host.count)
+            let rel = index.saturating_sub(host.dyn_virt_base());
+            let per_bank = host.dyn_per_bank().max(1);
+            let (bank, local) = ((rel / per_bank) as usize, rel % per_bank);
+            let taken = host
+                .banks
+                .get(bank)
+                .and_then(|b| b.next.lock().unwrap_or_else(|e| e.into_inner()).1.get(local as usize).copied());
+            format!("dynamic slot {} (taken {taken:?})", rel)
         };
         if twin {
             let made = host.twins.get(index as usize).map(|t| t.load(Relaxed));
@@ -3694,11 +3700,12 @@ impl HostHeap {
     }
 
     /// The shader-visible handle of slot `index` (primary bank).
+    #[allow(dead_code)]
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         self.gpu_handle_in(0, index)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let (b, phys) = match self.resolve_for_read(index) {
             Some(SlotTarget::Title { phys }) => (0, phys),
