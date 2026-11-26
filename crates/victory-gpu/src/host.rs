@@ -9693,7 +9693,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = crate::capture::wanted(frame);
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9783,7 +9783,6 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
-            #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
                     if composed {
@@ -9856,7 +9855,6 @@ impl Host {
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = flown;
-            #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }

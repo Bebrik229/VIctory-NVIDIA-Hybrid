@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Launches VIctory-NVIDIA-Hybrid with NVIDIA 12 GB + Native Barriers + Multi-Core Ports 1/5/6/7 tuning.
+    Launches VIctory-NVIDIA-Hybrid with NVIDIA 12 GB + Native Barriers + Multi-Core Ports 1/6/7 (PORT_CBV=0 NVIDIA color fix).
 .DESCRIPTION
     Portable launcher derived from run-cgbj-fast.ps1.
     Supports optional overrides while defaulting to local D:\gta6-re\... paths when present.
@@ -81,6 +81,8 @@ if (-not (Test-Path $TitleExe)) {
 if (-not $CacheDir) {
     if ($env:VICTORY_CACHE_DIR) {
         $CacheDir = $env:VICTORY_CACHE_DIR
+    } elseif (Test-Path 'D:\victory-data\cache-cgbj-fast') {
+        $CacheDir = 'D:\victory-data\cache-cgbj-fast'
     } elseif (Test-Path 'D:\victory-data\cache-cgbj-mc') {
         $CacheDir = 'D:\victory-data\cache-cgbj-mc'
     } else {
@@ -147,7 +149,7 @@ $env:VICTORY_CARD_BUFFERS_MB = '1536'
 $env:VICTORY_COMPOSE = '1'
 $env:VICTORY_WAIT_RESIDENT = '0'
 $env:VICTORY_PORT_CONSTANTS = '1'
-$env:VICTORY_PORT_CBV = '1'
+$env:VICTORY_PORT_CBV = '0' # NVIDIA 1M view-heap cap forces raw_twins=false; PORT_CBV=1 nulls non-256B CBVs -> B&W
 $env:VICTORY_PORT_GUARD = '1'
 $env:VICTORY_PORT_GUARD_PLAN = '1'
 $env:VICTORY_PORT_JOURNAL = '1'
@@ -187,7 +189,7 @@ if ($SmoothMotion) {
     $LaunchExe = $smPath
 }
 
-Write-Host "[run-nvidia-fast] Mode: $mode | Console: $Console | Output: $($env:VICTORY_OUTPUT) | Scale: $($env:VICTORY_RENDER_SCALE) | NativeBarriers: $($env:VICTORY_NATIVE_BARRIERS) | Ports: 1,5,6,7 | SmoothMotion: $($SmoothMotion.IsPresent) | SkipPipelines: $($hashes.Count) | Mouse: F2/MMB lock, Esc unlock, F7/F8 sens ($($env:VICTORY_MOUSE_SENS)) | Cache: $CacheDir | Log: $LogPath"
+Write-Host "[run-nvidia-fast] Mode: $mode | Console: $Console | Output: $($env:VICTORY_OUTPUT) | Scale: $($env:VICTORY_RENDER_SCALE) | NativeBarriers: $($env:VICTORY_NATIVE_BARRIERS) | Ports: 1,6,7 (PORT_CBV=0) | SmoothMotion: $($SmoothMotion.IsPresent) | SkipPipelines: $($hashes.Count) | Mouse: F2/MMB lock, Esc unlock, F7/F8 sens ($($env:VICTORY_MOUSE_SENS)) | Cache: $CacheDir | Log: $LogPath"
 
 $argList = @('run')
 if (-not $DryRun) { $argList += '--execute' }

@@ -17,7 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+#[allow(dead_code)]
 mod capture;
 #[cfg(windows)]
 mod compose;
