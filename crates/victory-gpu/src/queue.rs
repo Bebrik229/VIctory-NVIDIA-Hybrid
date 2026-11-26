@@ -247,7 +247,12 @@ fn submit_split(this: This, lists: &[This]) {
         // They have run: their descriptor tables' slots are free again, as in
         // the non-split path. The lists are not detached here, so without this
         // split parallel submissions keep their dynamic slots until reset.
-        crate::list::tables_done(&lists[..cut]);
+        // A list also held behind the wait is run again from the same
+        // recording: its slots must stay with that recording until the held
+        // execution. Lists not named again can give theirs back now.
+        let held = &lists[cut..];
+        let done: Vec<_> = lists[..cut].iter().copied().filter(|l| !held.contains(l)).collect();
+        crate::list::tables_done(&done);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
