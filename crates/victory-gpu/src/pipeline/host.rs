@@ -141,7 +141,6 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
         host.RenderTarget = [first; 8];
     } else if !host.IndependentBlendEnable.as_bool() && any_integer && !any_blendable {
         host.RenderTarget[0].BlendEnable = false.into();
-        host.RenderTarget[0].LogicOpEnable = false.into();
     }
 
     if host.IndependentBlendEnable.as_bool() {
@@ -151,10 +150,10 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     }
     for (i, target) in host.RenderTarget.iter_mut().enumerate() {
         let inactive = i >= count || targets.RTFormats[i] == DXGI_FORMAT_UNKNOWN;
-        if inactive || integer(i) {
+        if host.IndependentBlendEnable.as_bool() && (inactive || integer(i)) {
             target.BlendEnable = false.into();
         }
-        if inactive {
+        if host.IndependentBlendEnable.as_bool() && inactive {
             target.LogicOpEnable = false.into();
         }
     }
@@ -1255,7 +1254,7 @@ mod tests {
         let host = host_blend(&b, &t);
         assert!(!host.IndependentBlendEnable.as_bool());
         assert!(!host.RenderTarget[0].BlendEnable.as_bool());
-        assert!(!host.RenderTarget[0].LogicOpEnable.as_bool());
+        assert!(host.RenderTarget[0].LogicOpEnable.as_bool());
     }
 
     #[test]
