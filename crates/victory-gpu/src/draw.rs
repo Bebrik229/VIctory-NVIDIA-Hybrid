@@ -4050,6 +4050,9 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(group.slot)) else { continue };
             for used in &group.entries {
                 let handle = table + u64::from(used.table_offset_dwords) * 4;
+                if self.heap_of(handle).is_none() {
+                    continue;
+                }
                 let Some(view) = crate::descriptor::view(handle) else { continue };
                 let Some((shadow, address, bytes)) = crate::descriptor::host::buffer_copy(&view) else { continue };
                 if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert((shader.to_owned(), address, bytes)) {
