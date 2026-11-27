@@ -4294,7 +4294,7 @@ impl<'a> Lower<'a> {
     /// host's waves are not the console's (pixel, vertex and mesh programs): there a lane
     /// answers for itself, as before.
     fn is_wave_scc_branch(&self, b: usize) -> bool {
-        !self.local && self.mask_data == MaskData::Console && self.x.st.wave_scc.contains(&b)
+        !self.local && self.mask_data == MaskData::Console && self.x.st.wave_scc.contains_key(&b)
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {

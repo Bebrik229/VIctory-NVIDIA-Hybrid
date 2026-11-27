@@ -1065,3 +1065,31 @@ fn a_store_behind_the_mask_scc_branch_keeps_its_exec_guard() {
     assert_eq!(stores, [true]);
     lowered(&native, &p, &HashSet::new()).expect("two host waves");
 }
+
+/// Two branches on the same mask SCC go the same way, which is the wave's: a descriptor
+/// loaded behind the first is the one a store behind the second uses, and no lane gets to
+/// the store past the load.
+#[test]
+fn a_descriptor_loaded_behind_one_mask_scc_branch_is_known_behind_the_next() {
+    let native = native(&[
+        0xBF8C_0000, // s_waitcnt 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0xBF84_0003, // s_cbranch_scc0 past the load
+        0xF408_0502,
+        0xFA00_0000, // s_load_dwordx4 s[20:23], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt 0
+        0xBF84_0004, // s_cbranch_scc0 past the store
+        0x7E04_0282, // v_mov_b32 v2, 2
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8005_0201, // buffer_store_dword v2, v1, s[20:23], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+    lowered_on(&native, &p, &HashSet::new(), 64).expect("console waves");
+    let local = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new()));
+    lower::take_needs();
+    local.expect("local waves");
+}
