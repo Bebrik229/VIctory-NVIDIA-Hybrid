@@ -83,6 +83,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(hint) = empty_hint(keys.len(), early.len(), used) {
         println!("{hint}");
     }
+    if keys.is_empty() {
+        return Ok(());
+    }
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
