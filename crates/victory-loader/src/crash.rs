@@ -736,7 +736,8 @@ fn reach_of(
                 1 if reg == 0 => (2, u64::from(slot(i + 1)?) * 8, 0),
                 1 if reg == 1 => (3, long(i + 1)?, 0),
                 2 => (1, u64::from(reg) * 8 + 8, 0),
-                3 if reg == 0 && register != 0 => {
+                // MSVC repeats the frame offset in the reserved operation info.
+                3 if register != 0 => {
                     if active {
                         if restores & (1 << register) != 0 {
                             return None;
@@ -1120,6 +1121,15 @@ mod tests {
         assert_eq!(
             reach_of(&FRAMED, Some(4), none).map(|r| r.frame),
             Some(Some((5, 0)))
+        );
+        // `lea rbp, [rsp+0x40]` as ntdll's RtlRaiseException records it.
+        let msvc = [0x01, 8, 3, 0x45, 0x08, 0x43, 0x04, 0x52, 0x01, 0x50];
+        assert_eq!(
+            reach_of(&msvc, None, none),
+            Some(Reach {
+                bytes: 8 + 8 + 0x30,
+                frame: Some((5, 4))
+            })
         );
     }
 
