@@ -904,6 +904,36 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// `n` consecutive dynamic slots of `host` in `bank`
+/// ([`crate::descriptor::host::HostHeap::dynamic_in`]). With none free, the
+/// flights in the air are landed first, which gives back the slots of their
+/// lists, and the slots are asked for again. `None`: refused again; the
+/// caller drops its draw or dispatch.
+///
+/// Diagnostics builds count these waits and the tables refused after them
+/// (the frame line's "dynamic slots"), so that a wait for slots is not
+/// taken for the title's.
+fn dynamic_or_settle(host: &crate::descriptor::host::HostHeap, bank: usize, n: u32) -> Option<u32> {
+    if let Some(first) = host.dynamic_in(bank, n) {
+        return Some(first);
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    crate::host::settle_for_fence();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::DynamicSettles, 1);
+        add(C::DynamicSettleUs, started.elapsed().as_micros() as u64);
+    }
+    let first = host.dynamic_in(bank, n);
+    #[cfg(feature = "diagnostics")]
+    if first.is_none() {
+        crate::copystat::add(crate::copystat::C::DynamicLost, 1);
+    }
+    first
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -2056,10 +2086,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic_in(bank, 1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic_in(bank, 1)
-                }) else {
+                let Some(index) = dynamic_or_settle(host, bank, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, heap.id, index, 1));
@@ -2131,10 +2158,7 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic_in(bank, 1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic_in(bank, 1)
-                }) else {
+                let Some(index) = dynamic_or_settle(host, bank, 1) else {
                     return false;
                 };
                 self.dynamic.push((key.0, heap.id, index, 1));
@@ -4000,10 +4024,7 @@ impl State {
                 continue;
             }
             let bank = self.view_bank_for(std::ptr::from_ref(heap) as usize);
-            let Some(first) = host.dynamic_in(bank, n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic_in(bank, n)
-            }) else {
+            let Some(first) = dynamic_or_settle(host, bank, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
