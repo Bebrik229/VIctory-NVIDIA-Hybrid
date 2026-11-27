@@ -117,6 +117,10 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 cargo build --release -j 1 -p victory
 ```
 
+### Agility SDK runtime
+
+`victory.exe` requests the application-local DirectX Agility SDK 1.619 from a `d3d12sdk` folder beside the executable (`ID3D12Device13`, used by `VICTORY_PORT_CONSTANTS` and `VICTORY_INPLACE`). Download [Microsoft.Direct3D.D3D12 1.619.6](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.6), open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` into `target\release\d3d12sdk\`. Keep the folder beside the executable if you move it. `victory run`, `warm` and `replay` print a warning naming the expected path when the file is missing.
+
 ### 2. Launch (Recommended RTX 12 GB Fast Preset)
 
 ```powershell
