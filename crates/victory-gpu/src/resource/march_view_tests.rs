@@ -1,7 +1,6 @@
 //! An outstanding list's UAV and resource stay paired through another list's reset.
 use super::HostTexture;
 use crate::host::{Host, HostList};
-use crate::rootsig::Param;
 use std::sync::Arc;
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*, Dxgi::*};
 use windows::core::{Interface, s};
@@ -143,25 +142,13 @@ fn march_views_are_immutable_across_interleaved_lists_and_reset() {
         .position(|&x| x == 0)
         .unwrap_or(desc.Description.len());
     let name = String::from_utf16_lossy(&desc.Description[..end]);
-    let root = crate::rootsig::make(
-        &host.device,
-        &[
-            Param::Constants {
-                register: 0,
-                count: 1,
-            },
-            Param::UavTable {
-                register: 0,
-                count: 1,
-            },
-        ],
-        "march UAV lifetime test",
-    )
-    .unwrap();
     let code=crate::host::compile(
-        "cbuffer C : register(b0) { uint mark; }; RWTexture2D<float4> image : register(u0);
-         [numthreads(4,4,1)] void main(uint3 p:SV_DispatchThreadID) { image[p.xy]=float4(mark,p.x,p.y,1); }",
+        "#define RS \"RootConstants(num32BitConstants=1, b0), DescriptorTable(UAV(u0))\"
+         cbuffer C : register(b0) { uint mark; }; RWTexture2D<float4> image : register(u0);
+         [RootSignature(RS)] [numthreads(4,4,1)] void main(uint3 p:SV_DispatchThreadID) { image[p.xy]=float4(mark,p.x,p.y,1); }",
         s!("main"),s!("cs_5_1")).unwrap();
+    // SAFETY: the compiled shader carries its root signature.
+    let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &code).unwrap() };
     // SAFETY: the root signature and bytecode outlive pipeline creation.
     let pso: ID3D12PipelineState = unsafe {
         host.device
