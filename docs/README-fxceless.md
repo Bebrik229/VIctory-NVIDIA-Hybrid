@@ -250,6 +250,15 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Three window and input switches are off unless set to `1` (unset, the
+window and input are as before):
+
+| Switch | What it does |
+|--------|--------------|
+| `VICTORY_FULLSCREEN=1` | The title's own top-level window has no border and covers the monitor it was created on. `VICTORY_FULLSCREEN_RES=WIDTHxHEIGHT` gives it another size from that monitor's top-left corner. |
+| `VICTORY_IME_ENGLISH=1` | The window thread's keyboard layout is switched to en-US when the window is created and each time it gets focus, so an input method does not take the keys. Needs the en-US layout installed; otherwise a warning is logged and nothing changes. |
+| `VICTORY_MOUSE_CAPTURE=1` | While the title's window has focus the pointer is hidden and kept inside its client area (released on focus loss), and its motion and buttons are a GameInput mouse device. Mouse look (`VICTORY_MOUSE_LOOK`, F2) is off while this is on: both would move the pointer. `VICTORY_MOUSE_WARP=1` also puts the pointer back at the centre after every sample. |
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
