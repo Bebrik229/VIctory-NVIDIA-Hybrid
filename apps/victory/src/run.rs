@@ -56,10 +56,15 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // The known build's Series S upscaler choice (victory-loader's
+    // `resolution`): both pickers return the title's own upscaler.
+    let upscaler_default = build.is_some()
+        && known_patches_on(console, std::env::var("VICTORY_TITLE_PATCHES").ok().as_deref());
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -197,7 +202,41 @@ pub fn run(
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped and nothing of it has run yet.
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size, upscaler_default) };
+    }
+    // VICTORY_MAX_STEP_MS=<ms> (off without it): the title's longest
+    // simulation step (1/15 s) raised to reduce slowdown below
+    // 15 frames a second (victory-game's `step`). Only on the known build,
+    // every site compared first (all or nothing).
+    #[cfg(windows)]
+    if execute && let Ok(spec) = std::env::var("VICTORY_MAX_STEP_MS") {
+        match (victory_game::step::parse_ms(&spec), build) {
+            (Err(why), _) => eprintln!("VIctory: {why}; the title's step is left as it is"),
+            (Ok(_), None) => eprintln!("VIctory: VICTORY_MAX_STEP_MS: not a known build of the title; its step is left as it is"),
+            (Ok(ms), Some(_)) => {
+                let size = image.info().size_of_image as usize;
+                let patches = victory_game::step::patches(ms);
+                let sites: Vec<_> = patches
+                    .iter()
+                    .map(|(rva, old, new)| (*rva as usize, old.as_slice(), new.as_slice()))
+                    .collect();
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                match unsafe { victory_loader::resolution::write_all(image.base(), size, &sites) } {
+                    Ok(()) => {
+                        for (rva, old, new) in &patches {
+                            println!(
+                                "title patch    +{rva:#x} longest step {ms} ms (VICTORY_MAX_STEP_MS): {} -> {}",
+                                hex_str(old),
+                                hex_str(new)
+                            );
+                        }
+                    }
+                    Err((index, why)) => {
+                        eprintln!("VIctory: VICTORY_MAX_STEP_MS: +{:#x} {why:?}; the title's step is left as it is", patches[index].0);
+                    }
+                }
+            }
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -502,9 +541,38 @@ impl LoaderLock {
     }
 }
 
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether the known build's Series S upscaler choice applies, given
+/// `VICTORY_TITLE_PATCHES` (`var`): `0` never, `1` on any console; unset
+/// (or anything else), only with `--console series-s`. On a Series X the
+/// pickers already return what is written.
+fn known_patches_on(console: Console, var: Option<&str>) -> bool {
+    match var.map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => matches!(console, Console::SeriesS),
+    }
+}
+
 #[cfg(test)]
 mod absent_tests {
     use super::absent_title_dlls;
+
+    /// The known build's upscaler choice: on with `--console series-s`, off
+    /// on a Series X unless asked for, and off everywhere with `0`.
+    #[test]
+    fn title_patches_follow_the_console_and_the_switch() {
+        use super::{Console, known_patches_on};
+        assert!(known_patches_on(Console::SeriesS, None));
+        assert!(!known_patches_on(Console::SeriesX, None));
+        assert!(!known_patches_on(Console::SeriesS, Some("0")));
+        assert!(known_patches_on(Console::SeriesX, Some("1")));
+    }
 
     #[test]
     fn title_dlls_missing_from_the_folder_are_named_once() {
