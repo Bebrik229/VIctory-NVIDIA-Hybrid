@@ -262,6 +262,7 @@ impl Table {
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
+#[allow(dead_code)]
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
