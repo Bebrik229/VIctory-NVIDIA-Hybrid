@@ -17,6 +17,7 @@
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** (`avatarmanz`) — Thin command lists (`VICTORY_THIN`), multi-threaded submission preparation (`VICTORY_JOIN_PARTS`), `VICTORY_CARD_STEPS`, relay/landing architecture, and frame replay diagnostics.
 - **`Davidjc13/VIctory-7900XTX`** (`Davidjc13`) — Texture sweep / card-space wait optimizations and LDS atomic wave32 handling.
 - **`trustno1-coder/VIctory-NVIDIA`** — NVIDIA descriptor/performance speedups.
+- **[LooperSalty/AnyXboxX](https://github.com/LooperSalty/AnyXboxX)** — PS5 pad (DualSense, DualSense Edge) HID input (`gameinput/dualsense.rs`), via `trustno1-coder/VIctory-NVIDIA`.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (`beloooo`) — Indirect-light ambient stand-in discovery (`VICTORY_AMBIENT`), pipeline worker threading, and `romainhedouin`'s contributions.
 - **`triippywhale`** — `fix/amd-view-heap-clamp` view heap clamping work.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[DexNom/VIctory](https://github.com/DexNom/VIctory)**, **[myokex/victory-amd](https://github.com/myokex/victory-amd)**, **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**, `Geckomacabre`, `cxy0072019-sketch`, `Spexivus`, `joroyt`, `tightfall`, `Joshua Odom` — Additional D3D12, texture readback, sparse texture, cube gradient, and guard improvements noted in upstream documentation.

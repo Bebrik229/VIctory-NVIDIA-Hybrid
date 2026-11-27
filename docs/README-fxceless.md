@@ -250,6 +250,13 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+PS5 pads (DualSense, DualSense Edge) are read straight from HID, over USB
+or Bluetooth, with no remapper. XInput pads are read first: by default the
+HID pads are used only while XInput lists no pad (a remapper such as Steam
+Input shows the same pad through XInput). `VICTORY_DUALSENSE=1` uses both,
+HID pads taking the slots XInput leaves free; `VICTORY_DUALSENSE=0` turns
+the HID pads off. They have no rumble.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
