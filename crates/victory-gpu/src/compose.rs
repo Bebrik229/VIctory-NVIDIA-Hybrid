@@ -11,19 +11,16 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -43,10 +40,10 @@ unsafe impl Send for Composer {}
 unsafe impl Sync for Composer {}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
+    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the source and names live through the call; the out pointers are
     // ours.
-    unsafe {
+    let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
@@ -58,25 +55,96 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        tracing::warn!(error = %e, log = %blob_text(errors.as_ref()), "display composer shader not compiled");
+        return Err(e);
     }
     code.ok_or_else(windows::core::Error::empty)
+}
+
+fn blob_bytes(b: &ID3DBlob) -> &[u8] {
+    // SAFETY: the blob's own bytes, alive as long as the borrow.
+    unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }
+}
+
+fn blob_text(b: Option<&ID3DBlob>) -> String {
+    b.map(|b| String::from_utf8_lossy(blob_bytes(b)).into_owned())
+        .unwrap_or_default()
+}
+
+/// The composer's root signature, built here rather than with an HLSL
+/// `[RootSignature]` attribute, which Wine's d3dcompiler does not compile:
+/// t0-t1 in a table for the pixel shader and a linear clamping sampler at s0.
+fn root_signature_blob() -> windows::core::Result<ID3DBlob> {
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
+    let params = [D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &range,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    }];
+    // The values an HLSL StaticSampler leaves at their defaults.
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MaxAnisotropy: 16,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        ..Default::default()
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 1,
+        pStaticSamplers: &sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let (mut blob, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the description and what it points at live through the call.
+    let made = unsafe {
+        D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            &mut blob,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, log = %blob_text(errors.as_ref()), "display composer root signature not made");
+        return Err(e);
+    }
+    blob.ok_or_else(windows::core::Error::empty)
 }
 
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         let (vs, ps) = (
-            compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
+            compile(s!("vs"), s!("vs_5_0"))?,
+            compile(s!("ps"), s!("ps_5_0"))?,
         );
+        let signature = root_signature_blob()?;
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let root: ID3D12RootSignature =
+                device.CreateRootSignature(0, blob_bytes(&signature))?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),
@@ -207,6 +275,32 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
         90 => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
         10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(d.Format),
         _ => None,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod wine_tests {
+    use super::*;
+
+    /// Wine's d3dcompiler fails an HLSL `[RootSignature]` attribute, which
+    /// left the display composer unmade on Proton.
+    #[test]
+    fn source_carries_no_root_signature_attribute() {
+        assert!(!SOURCE.contains("RootSignature"));
+    }
+
+    #[test]
+    fn root_signature_serializes_without_the_shader_compiler() {
+        let blob = root_signature_blob().unwrap();
+        assert_eq!(&blob_bytes(&blob)[..4], b"DXBC");
+    }
+
+    #[test]
+    fn shaders_compile_as_shader_model_5_0() {
+        for (entry, target) in [(s!("vs"), s!("vs_5_0")), (s!("ps"), s!("ps_5_0"))] {
+            let code = compile(entry, target).unwrap();
+            assert_eq!(&blob_bytes(&code)[..4], b"DXBC");
+        }
     }
 }
 
