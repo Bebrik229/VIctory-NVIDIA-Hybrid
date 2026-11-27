@@ -134,6 +134,7 @@ Speed and memory:
 - Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Independent host-copy refreshes run in parallel by default on systems with at least four logical CPUs (`VICTORY_WIDE_REFRESH=0` disables this; `=1` forces it). This targets the serial memory reads that previously cost about 45–50 ms per frame on the test run.
+- Lazy state preludes can be reused across host lists (`VICTORY_PRELUDE_POOL=1`, off by default): the allocator and command list go back to a pool when the owning list resets, after its prior submission has finished. The pool holds up to 128 idle pairs, also under host memory pressure, so that sustained pressure does not make every batch recreate command allocators.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
