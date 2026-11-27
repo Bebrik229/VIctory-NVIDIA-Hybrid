@@ -1221,3 +1221,54 @@ fn a_branch_on_the_count_of_exec_is_not_one_on_a_mask_scc() {
     lowered_on(&native, &p, &HashSet::new(), 64).expect("console waves");
     lowered(&native, &p, &HashSet::new()).expect("two host waves");
 }
+
+/// (from cool_fox d2f2397) The branch-only program with an EXEC skip that cannot be left
+/// out: the skipped code sets s20, which the code after the join stores. The branch on the
+/// mask's SCC then stands where not every lane runs, in every form.
+fn mask_scc_behind_a_kept_skip() -> NativeProgram {
+    native(&[
+        0xBF8C_0000, // s_waitcnt 0: the descriptor
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz to the restore
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0xBE94_0387, // s_mov_b32 s20, 7
+        0xBF84_0002, // s_cbranch_scc0 to the value 1
+        0x7E04_0282, // v_mov_b32 v2, 2
+        0xBF82_0001, // s_branch to the store
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E06_0214, // v_mov_b32 v3, s20
+        0xE070_1000,
+        0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+    ])
+}
+
+/// A program none of whose forms can take a branch on a mask's SCC by the whole wave is
+/// still translated, as it was when each lane took the branch by its own bit: cool_fox
+/// dropped such a dispatch and the title read what it had not written back as a pointer.
+/// Here the local waves take it ([`Lower::is_wave_scc_branch`] leaves the branch per lane).
+#[test]
+fn a_mask_scc_branch_no_form_can_take_by_the_wave_still_translates() {
+    let native = mask_scc_behind_a_kept_skip();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    assert!(ir::without_skips(&p, false).is_none(), "the skip is kept: the code after it reads s20");
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(st.wave_scc.len(), 1, "the branch on the mask's SCC is the wave's");
+    let direct = lowered(&native, &p, &HashSet::new());
+    lower::take_needs();
+    assert!(
+        matches!(&direct, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what)),
+        "{:?}",
+        direct.err()
+    );
+    let shader = emit_nested_mask_scc(&native, &p);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+}
