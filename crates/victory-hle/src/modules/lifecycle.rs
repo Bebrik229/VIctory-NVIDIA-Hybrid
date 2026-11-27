@@ -166,6 +166,7 @@ fn fit(
     height: i32,
 ) -> (i32, i32, i32, i32) {
     if placeable(ex_style, style, !parent.is_null())
+        && !zero_sized(style, width, height)
         && let Some(area) = chosen_monitor()
         && let Some(placed) = on_monitor(&area, width, height, window_limit())
     {
@@ -193,6 +194,17 @@ fn fit(
 /// not a tool window.
 fn placeable(ex_style: u32, style: u32, parented: bool) -> bool {
     !parented && style & wm::WS_CHILD == 0 && ex_style & wm::WS_EX_TOOLWINDOW == 0
+}
+
+/// Whether a window asks for no area of its own. Win32 supplies a default
+/// size to overlapped windows, and uses zero size for a pop-up or child
+/// with a default width.
+fn zero_sized(style: u32, width: i32, height: i32) -> bool {
+    match width {
+        wm::CW_USEDEFAULT => style & (wm::WS_POPUP | wm::WS_CHILD) != 0,
+        0 => true,
+        _ => height == 0,
+    }
 }
 
 /// Where a window of `width` x `height` goes on the work area `area` of the
@@ -523,6 +535,31 @@ mod tests {
         assert!(!placeable(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, false));
         assert!(!placeable(0, wm::WS_CHILD, false));
         assert!(!placeable(0, wm::WS_OVERLAPPEDWINDOW, true));
+    }
+
+    /// A default-sized window (`CW_USEDEFAULT` width; Windows ignores the
+    /// height, here 0) is a normal window and is placed; a width of 0 is not.
+    #[test]
+    fn a_default_width_with_zero_height_is_not_a_zero_sized_helper() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_OVERLAPPEDWINDOW;
+        assert!(!zero_sized(style, default, 0));
+        assert!(!zero_sized(style, default, default));
+        assert!(zero_sized(style, 0, 0));
+        assert!(zero_sized(style, 0, 600));
+        assert!(zero_sized(style, 800, 0));
+        let area = RECT { left: -2560, top: -200, right: 0, bottom: 1240 };
+        assert_eq!(on_monitor(&area, default, 0, None), Some((-2240, -20, 1920, 1080)));
+    }
+
+    #[test]
+    fn a_popup_with_default_width_keeps_its_native_zero_size() {
+        let default = wm::CW_USEDEFAULT;
+        let style = wm::WS_POPUP;
+        assert!(zero_sized(style, default, 0));
+        assert!(zero_sized(style, default, 600));
+        assert!(zero_sized(wm::WS_CHILD, default, 600));
+        assert!(!zero_sized(style, 800, 600));
     }
 
     /// `VICTORY_MONITOR`: a device name with or without its prefix, any
