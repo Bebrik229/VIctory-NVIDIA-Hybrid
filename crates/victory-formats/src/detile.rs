@@ -830,7 +830,7 @@ fn prepare_thin_geometry(
     let mut x_in_block = [0usize; 16];
     for (i, slot) in x_in_block.iter_mut().take(mx_per_block).enumerate() {
         let idx = i.checked_mul(micro_w as usize)?;
-        let off = *layout.pattern[0].get(idx)? as usize;
+        let off = *layout.pattern.axes[0].get(idx)? as usize;
         if (off & 0xff) != 0 || off >= block_bytes {
             return None;
         }
@@ -839,7 +839,7 @@ fn prepare_thin_geometry(
     let mut y_in_block = [0usize; 16];
     for (i, slot) in y_in_block.iter_mut().take(my_per_block).enumerate() {
         let idx = i.checked_mul(micro_h as usize)?;
-        let off = *layout.pattern[1].get(idx)? as usize;
+        let off = *layout.pattern.axes[1].get(idx)? as usize;
         if (off & 0xff) != 0 || off >= block_bytes {
             return None;
         }

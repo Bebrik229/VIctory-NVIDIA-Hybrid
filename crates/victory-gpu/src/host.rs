@@ -1872,6 +1872,31 @@ const SPARE_MOST: u64 = 128 << 20;
 /// The same with [`keep_freed`].
 const SPARE_KEPT: u64 = 1 << 30;
 
+/// The most bytes of chunks kept while no list holds them: [`SPARE_KEPT`]
+/// with [`keep_freed`] on a PC of more than 32 GB, else [`SPARE_MOST`].
+/// `VICTORY_SCRATCH_SPARE_MB` sets it instead (`0`: none kept, every chunk
+/// is freed when its list gives it back). Lower, more chunks are freed at
+/// give-back and made anew by the next list; nothing else changes.
+fn spare_most() -> u64 {
+    static ASKED: OnceLock<Option<u64>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("VICTORY_SCRATCH_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    spare_limit(asked, keep_freed(), crate::residency::limited_host_ram())
+}
+
+/// [`spare_most`] for a limit asked in MiB, [`keep_freed`] and a PC of
+/// 32 GB or less (`limited`).
+fn spare_limit(asked_mb: Option<u64>, keep: bool, limited: bool) -> u64 {
+    match asked_mb {
+        Some(mb) => mb.saturating_mul(1 << 20),
+        None if keep && !limited => SPARE_KEPT,
+        None => SPARE_MOST,
+    }
+}
+
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
 /// is reset or dropped, for the next list. Before, a list kept every chunk
@@ -1940,7 +1965,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
-/// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
+/// or dropped): kept for the next list, or freed past [`spare_most`] and
 /// without the pool.
 fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
@@ -1951,12 +1976,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, spare_most())
             } else {
                 Some(chunk)
             };
@@ -3516,6 +3536,35 @@ fn land() {
     }
 }
 
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: caller owns the event and fence for the entire wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3557,11 +3606,9 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3693,6 +3740,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("relay fence reported device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3720,14 +3771,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -3929,6 +3973,7 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::port_rt::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3956,6 +4001,8 @@ mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
 pub(crate) mod upcheck;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtstamps;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -4248,6 +4295,19 @@ impl Host {
         })
     }
 
+    /// Whether the host is running on a software adapter (WARP).
+    pub(crate) fn is_software(&self) -> bool {
+        static SOFTWARE: OnceLock<bool> = OnceLock::new();
+        *SOFTWARE.get_or_init(|| {
+            if let Some(adapter) = &self.adapter
+                && let Ok(desc) = unsafe { adapter.GetDesc() }
+            {
+                return desc.VendorId == 0x1414;
+            }
+            false
+        })
+    }
+
     /// Whether the host GPU supports the depth bounds test; logged once.
     pub(crate) fn depth_bounds(&self) -> bool {
         static BOUNDS: OnceLock<bool> = OnceLock::new();
@@ -4263,7 +4323,7 @@ impl Host {
                     )
                     .is_ok()
             };
-            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            let supported = ok && options.DepthBoundsTestSupported.as_bool() && !self.is_software();
             tracing::info!(supported, "host depth bounds support");
             supported
         })
@@ -6943,10 +7003,21 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // A target whose ticket went stale (the title reused or remapped the
+        // memory it tiles into) must be re-registered, or the read-back
+        // would be dropped as one of memory the texture no longer holds.
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
     }
 
@@ -6972,6 +7043,24 @@ impl HostList {
             u.behind[0] = Some(true);
             self.changed_something();
         }
+    }
+
+    /// For tests: whether the list's read-back wants a *fresh* target for
+    /// `resource` — one whose ticket has not gone stale. A stale target is
+    /// one the title's memory reuse invalidated, which the list must
+    /// re-register on the next write of `resource`.
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    /// For tests: how many texture read-backs the list recorded at its close.
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// At submission: the list that moves each texture this list uses from
@@ -7202,9 +7291,38 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+            .push(Step::Fill(dst as usize, src, len, None));
+    }
+
+    /// Renderer port RT: where a fill of `[src, src + len)` recorded now
+    /// takes its bytes. If the last step of this list that writes them is a
+    /// copy at its place ([`place`]) that holds all of them and copies what
+    /// the CPU takes out of its source at submission, and no step since
+    /// writes the source or declares a shader write over either, the fill
+    /// takes them out of that source: the same bytes the card has there when
+    /// the list reads them (`crate::port_rt`). Else `src`.
+    fn forward_fill(&self, src: usize, len: usize) -> usize {
+        if !crate::port_rt::on() || len == 0 {
+            return src;
+        }
+        let deferred = self.deferred();
+        let seen = deferred.copies.iter().rev().map(|step| match step {
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
+            &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
+            Step::Run(_) => crate::port_rt::Seen::Anything,
+            _ => crate::port_rt::Seen::Nothing,
+        });
+        match crate::port_rt::forwarded(seen, src, len) {
+            Some(from) => {
+                crate::port_rt::count(crate::port_rt::FORWARDED);
+                from
+            }
+            None => src,
+        }
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7225,16 +7343,18 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let src = self.forward_fill(src as usize, len);
+        self.deferred().copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -10481,7 +10601,24 @@ mod trail {
 
 #[cfg(test)]
 mod spare {
-    use super::Spare;
+    use super::{SPARE_KEPT, SPARE_MOST, Spare, spare_limit};
+
+    /// Unset, the limit is as it was: 1 GiB with `keep_freed` on a PC of
+    /// more than 32 GB, 128 MiB otherwise. An asked limit wins.
+    #[test]
+    fn spare_limit_is_as_before_unless_asked() {
+        assert_eq!(SPARE_KEPT, 1 << 30);
+        assert_eq!(SPARE_MOST, 128 << 20);
+        assert_eq!(spare_limit(None, true, false), 1 << 30);
+        assert_eq!(spare_limit(None, true, true), 128 << 20);
+        assert_eq!(spare_limit(None, false, false), 128 << 20);
+        assert_eq!(spare_limit(None, false, true), 128 << 20);
+        for (keep, limited) in [(true, false), (true, true), (false, false), (false, true)] {
+            assert_eq!(spare_limit(Some(64), keep, limited), 64 << 20);
+            assert_eq!(spare_limit(Some(0), keep, limited), 0);
+        }
+        assert_eq!(spare_limit(Some(u64::MAX), true, false), u64::MAX);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
