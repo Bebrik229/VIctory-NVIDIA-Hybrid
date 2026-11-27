@@ -4288,30 +4288,12 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(at, pred::NE, both, z))
     }
 
-    /// Whether block `b` ends in `s_cbranch_scc0/1` on the SCC of a mask operation that does
-    /// not write EXEC ([`Structured::scc_some`]): the console takes it by the whole wave.
+    /// Whether the branch closing block `b` is one the console takes by the whole wave on the
+    /// SCC of a mask operation ([`Structured::wave_scc`]) and is lowered so ([`Self::wave_wide`]).
     /// Not with each host wave as a wave of its own ([`with_local_waves`]): there a half
     /// answers for itself, as before.
     fn is_wave_scc_branch(&self, b: usize) -> bool {
-        if self.local {
-            return false;
-        }
-        let Some(last) = self.x.p.blocks[b].insts.last() else {
-            return false;
-        };
-        if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
-            return false;
-        }
-        let Some(scc) = last.read(Reg::Scc) else {
-            return false;
-        };
-        if !self.x.st.scc_some.contains_key(&scc) {
-            return false;
-        }
-        let def_block = self.def_block.get(&scc).copied().unwrap_or(b);
-        !self.x.p.blocks[def_block].insts.iter().any(|i| {
-            i.write(Reg::Scc) == Some(scc) && i.write(Reg::S(crate::ir::EXEC)).is_some()
-        })
+        !self.local && self.x.st.wave_scc.contains(&b)
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {

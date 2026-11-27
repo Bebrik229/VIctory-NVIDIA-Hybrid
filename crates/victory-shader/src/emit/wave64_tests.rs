@@ -1028,3 +1028,40 @@ fn a_branch_alone_on_the_mask_scc_still_lowers_with_local_waves() {
     lower::take_needs();
     local.expect("local waves");
 }
+
+/// The whole wave enters the block behind such a branch, also the lanes whose own bit of the
+/// tested mask is clear and the lanes outside EXEC: the store there keeps its EXEC guard.
+#[test]
+fn a_store_behind_the_mask_scc_branch_keeps_its_exec_guard() {
+    let native = native(&[
+        0xBF8C_0000, // s_waitcnt 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0x7D84_0001, // v_cmp_eq_u32 vcc, s1, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0xBF84_0004, // s_cbranch_scc0 to the restore
+        0x7E04_0282, // v_mov_b32 v2, 2
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    let stores: Vec<bool> = p
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(b, block)| {
+            let guards = &st.guards[b];
+            block
+                .insts
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.name().starts_with("buffer_store"))
+                .map(move |(i, _)| guards[i].is_some())
+        })
+        .collect();
+    assert_eq!(stores, [true]);
+    lowered(&native, &p, &HashSet::new()).expect("two host waves");
+}
