@@ -3570,7 +3570,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
-    // Destinations of copies at their place, if a step reads them.
+    // Destinations of copies at their place encountered so far, if a later step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -3588,6 +3588,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         }
                         return Some(WHY_READ);
                     }
+                    if !placed.is_empty() && touches(&placed, src, src + len) {
+                        if count {
+                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a placed copy's destination, read by a buffer copy", &placed, src, len);
+                        }
+                        return Some(WHY_READ);
+                    }
                 }
                 &Step::Fill(_, src, len, _) => {
                     if read_blocked(written, src, len) {
@@ -3595,6 +3603,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             blame("a fill of upload memory", written, src, len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                    if !placed.is_empty() && touches(&placed, src, src + len) {
+                        if count {
+                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a placed copy's destination, read by a fill", &placed, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -3609,6 +3625,14 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         }
                         return Some(WHY_READ);
                     }
+                    if !placed.is_empty() && touches(&placed, at, at + len) {
+                        if count {
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a placed copy's destination, read by a texture", &placed, at, len);
+                        }
+                        return Some(WHY_READ);
+                    }
                 }
                 &Step::Plane((at, len), _) => {
                     if touches(written, at, at.saturating_add(len)) {
@@ -3619,25 +3643,52 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         }
                         return Some(WHY_READ);
                     }
-                }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Placed(p) => match p.waits(written) {
-                    place::Waits::No => {}
-                    place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
-                    place::Waits::Yes => {
+                    if !placed.is_empty() && touches(&placed, at, at.saturating_add(len)) {
                         if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            blame("a buffer copy at its place", written, p.src, p.len);
+                            blame("a placed copy's destination, read by a plane", &placed, at, len);
                         }
                         return Some(WHY_READ);
                     }
-                },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                }
+                Step::Run(_) => return Some(WHY_RUN),
+                Step::Placed(p) => {
+                    if !placed.is_empty() && p.from.is_some() && touches(&placed, p.src, p.src + p.len) {
+                        if count {
+                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a placed copy's destination, the source of a placed copy from the CPU", &placed, p.src, p.len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                    match p.waits(written) {
+                        place::Waits::No => {}
+                        place::Waits::ForReaders => join_ranges(&mut placed, [(p.dst, p.dst + p.len)]),
+                        place::Waits::Yes => {
+                            if count {
+                                LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                                #[cfg(feature = "diagnostics")]
+                                blame("a buffer copy at its place", written, p.src, p.len);
+                            }
+                            return Some(WHY_READ);
+                        }
+                    }
+                }
+                Step::Host(_, (from, to)) => {
+                    if !placed.is_empty() && touches(&placed, *from, *to) {
+                        if count {
+                            #[cfg(feature = "diagnostics")]
+                            blame("a placed copy's destination, read by a host step", &placed, *from, to - from);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                Step::Refresh(..) | Step::GpuWrite(..) => {}
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    None
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -5057,8 +5108,18 @@ impl Host {
                         } else {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
+                            const PIECE: usize = 64 << 10;
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            let mut prev_piece: Option<(usize, usize)> = None;
+                            for &(a, b) in ranges {
+                                if joins && a < b {
+                                    let pair = (a / PIECE, (b - 1) / PIECE);
+                                    if prev_piece == Some(pair) {
+                                        continue;
+                                    }
+                                    prev_piece = Some(pair);
+                                }
+                                let run = shadow.card_run(a, b);
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -8500,6 +8561,10 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// One-entry caches for [`Batch::add`] to avoid repeated hash lookups on
+    /// consecutive refreshes of the same copy.
+    last_ahead: (usize, usize, usize),
+    last_index: (usize, usize),
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8894,16 +8959,31 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if key == self.last_ahead.0 && self.last_ahead.1 <= address && end <= self.last_ahead.2 {
             return;
         }
-        match self.index.get(&key) {
-            Some(&at) => {
+        if let Some(&(from, to)) = self.ahead.get(&key)
+            && from <= address
+            && end <= to
+        {
+            self.last_ahead = (key, from, to);
+            return;
+        }
+        let found = if key == self.last_index.0 {
+            Some(self.last_index.1)
+        } else {
+            self.index.get(&key).copied()
+        };
+        match found {
+            Some(at) => {
+                self.last_index = (key, at);
                 let r = &mut self.refreshes[at];
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
             }
             None => {
-                self.index.insert(key, self.refreshes.len());
+                let at = self.refreshes.len();
+                self.index.insert(key, at);
+                self.last_index = (key, at);
                 self.refreshes.push((shadow.clone(), address, end));
             }
         }
@@ -8914,12 +8994,17 @@ impl Batch {
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead.remove(&key);
+            if self.last_ahead.0 == key {
+                self.last_ahead = (0, 0, 0);
+            }
         }
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(at) = self.index.remove(&key) else {
             return;
         };
+        self.last_index = (0, 0);
         let (shadow, from, to) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
@@ -8967,6 +9052,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.last_ahead = (0, 0, 0);
         self.textures.clear();
     }
 
@@ -9212,6 +9298,7 @@ impl Batch {
     fn flush(&mut self) {
         self.refresh_textures();
         self.index.clear();
+        self.last_index = (0, 0);
         if self.refreshes.is_empty() {
             return;
         }

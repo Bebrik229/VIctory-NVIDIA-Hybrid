@@ -58,7 +58,7 @@ pub(super) struct Placed {
     /// The destination's host copy.
     pub(super) shadow: std::sync::Arc<Shadow>,
     /// Upload memory the list copies from, to be given the source's bytes.
-    from: Option<usize>,
+    pub(super) from: Option<usize>,
 }
 
 impl Placed {
@@ -110,6 +110,7 @@ pub(super) enum Waits {
 }
 
 /// Whether a step of `runs` reads one of `ranges` on the CPU.
+#[allow(dead_code)]
 pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bool {
     join_ranges(&mut ranges, []);
     runs.iter().any(|list| {

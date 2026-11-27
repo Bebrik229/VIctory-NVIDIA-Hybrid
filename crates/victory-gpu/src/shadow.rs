@@ -1945,9 +1945,16 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, clamped `1..=12`).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+            .clamp(1, 12)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -4196,7 +4203,7 @@ impl Shadow {
             type Done = Option<Vec<(usize, usize)>>;
             let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
             let over = std::sync::atomic::AtomicBool::new(false);
-            let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
+            let done: Vec<std::sync::OnceLock<Done>> = (0..stale.len()).map(|_| std::sync::OnceLock::new()).collect();
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
                 let (lo, hi) = page_of(i);
@@ -4207,22 +4214,31 @@ impl Shadow {
                     // no two pages are the same.
                     let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
                     match runs {
-                        Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
+                        Ok(runs) => {
+                            let _ = done[i].set(runs);
+                        }
                         Err(()) => over.store(true, Ordering::Relaxed),
                     }
                 }
             };
             // (Not on the threads of `wide`: the thread that waits there
             // takes whatever work comes, and a landing's takes the lock.)
+            const CHUNK: usize = 8;
             if stale.len() > 2 && under_wide() {
-                crate::land::each_under(stale.len(), &one);
+                crate::land::each_under(stale.len().div_ceil(CHUNK), &|chunk| {
+                    let from = chunk * CHUNK;
+                    let to = (from + CHUNK).min(stale.len());
+                    for i in from..to {
+                        one(i);
+                    }
+                });
             } else {
                 (0..stale.len()).for_each(one);
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
-            for (i, runs) in done.into_iter().enumerate() {
-                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+            for (i, slot) in done.into_iter().enumerate() {
+                let Some(runs) = slot.into_inner().flatten() else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));

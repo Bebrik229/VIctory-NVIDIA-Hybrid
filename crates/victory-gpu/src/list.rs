@@ -2236,8 +2236,8 @@ pub(crate) fn barrier_test() -> u8 {
 
 /// Native barrier mode from `VICTORY_NATIVE_BARRIERS`:
 /// `0` = legacy global barriers (`"0"`),
-/// `1` = full native barriers + title elision (default / `"1"`),
-/// `2` = targeted host barriers only, never elide title `barrier`/`barrier_groups`/`sync` (`"targeted"`).
+/// `1` = full native barriers + title elision (`"1"`),
+/// `2` = targeted host barriers only, never elide title `barrier`/`barrier_groups`/`sync` (default / `"targeted"`).
 #[cfg(windows)]
 fn native_barrier_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -2245,8 +2245,8 @@ fn native_barrier_mode() -> u8 {
         let raw = std::env::var("VICTORY_NATIVE_BARRIERS").unwrap_or_default();
         let mode = match raw.trim() {
             "0" => 0,
-            "targeted" => 2,
-            _ => 1,
+            "1" => 1,
+            _ => 2,
         };
         tracing::info!(
             mode = raw.trim(),
@@ -2265,7 +2265,7 @@ pub(crate) fn native_barriers() -> bool {
 }
 
 /// Whether title `barrier` / `barrier_groups` / `sync` elision is enabled
-/// (`VICTORY_NATIVE_BARRIERS` not `"0"` and not `"targeted"`).
+/// (`VICTORY_NATIVE_BARRIERS == "1"`).
 #[cfg(windows)]
 pub(crate) fn native_elide() -> bool {
     native_barrier_mode() == 1

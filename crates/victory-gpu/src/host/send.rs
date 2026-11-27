@@ -195,16 +195,34 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    let short = |a: usize, b: usize| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
+    let mut chunk_words: Vec<usize> = Vec::new();
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut words = 0usize;
+        let mut in_chunk = 0usize;
+        let mut chunk_len = 0usize;
+        for &(a, b) in ranges {
+            if short(a, b) {
+                let w = (b - a) / 4;
+                words += w;
+                in_chunk += w;
+            } else {
+                runs.push((a, at, b - a));
+                at += ((b - a) as u64).next_multiple_of(16);
+            }
+            chunk_len += 1;
+            if chunk_len == RUNS_AT_A_TIME {
+                chunk_words.push(in_chunk);
+                in_chunk = 0;
+                chunk_len = 0;
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        if chunk_len > 0 {
+            chunk_words.push(in_chunk);
+        }
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -214,15 +232,17 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    let mut chunk_idx = 0usize;
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         // (80,000 runs of some words a frame: in pieces of work.)
         let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+            let words = chunk_words[chunk_idx];
+            chunk_idx += 1;
             if words > 0 {
-                work.push((from, ranges, to));
+                work.push((from, chunk, to));
                 to += words * 8;
             }
         }
@@ -230,7 +250,10 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+        for &(a, b) in ranges {
+            if !short(a, b) {
+                continue;
+            }
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these

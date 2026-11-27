@@ -2101,7 +2101,7 @@ pub(crate) fn look_at_holes() {
     }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
-        let g = guards();
+        let g = guards_shared();
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
         let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
@@ -2682,7 +2682,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let g = guards();
+    let g = guards_shared();
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }

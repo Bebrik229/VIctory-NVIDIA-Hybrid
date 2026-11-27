@@ -550,13 +550,48 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
-        return None;
+    if plan(&does, stage(), true, &mut behind) == Err(BEHIND_PLACED)
+        && let Some((placed, reader)) = behind
+    {
+        let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].place.0);
+        let cut = place(placed)? + 1;
+        if place(reader)? >= cut {
+            return Some(cut);
+        }
     }
-    let (placed, reader) = behind?;
-    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].place.0);
-    let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    // Also split after an earlier list's placed copy when a later list reads its destination
+    // (e.g. a fill exempted from `written` by `VICTORY_FILL_TITLE` that still reads `placed`),
+    // so the earlier list goes out immediately while the later list resolves on the card.
+    let mut placed: Vec<(usize, usize)> = Vec::new();
+    let mut cut_at: Option<usize> = None;
+    for (list_idx, list) in runs.iter().enumerate() {
+        let mut added = false;
+        for step in &list.deferred().copies {
+            if !placed.is_empty() {
+                let reads_placed = match step {
+                    &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => touches(&placed, src, src + len),
+                    Step::Placed(p) => p.from.is_some() && touches(&placed, p.src, p.src + p.len),
+                    _ => false,
+                };
+                if reads_placed
+                    && let Some(cut) = cut_at
+                    && list_idx >= cut
+                {
+                    return Some(cut);
+                }
+            }
+            if let Step::Placed(p) = step
+                && matches!(p.waits(&written), place::Waits::ForReaders)
+            {
+                join_ranges(&mut placed, [(p.dst, p.dst + p.len)]);
+                added = true;
+            }
+        }
+        if added && cut_at.is_none() && list_idx + 1 < runs.len() {
+            cut_at = Some(list_idx + 1);
+        }
+    }
+    None
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
