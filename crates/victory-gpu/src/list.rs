@@ -294,6 +294,38 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// [`recycle`] for lists that have only just landed
+/// (`VICTORY_RECYCLE_LANDED_EARLY=1`): the lists the card ran are reset and
+/// kept for [`fresh_list`] at once, and what their commands named (descriptor
+/// slots, upload memory, the objects the recording held) is retired on its
+/// own, as late as it would have gone with the list. A list that is not
+/// kept is retired too: nothing of a landed flight is freed before the lag.
+#[cfg(windows)]
+pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
+    for (i, mut detached) in lists.into_iter().enumerate() {
+        if !pools() || !ran.contains(&i) {
+            crate::host::retire(detached);
+            continue;
+        }
+        crate::host::retire((
+            std::mem::take(&mut detached._state),
+            std::mem::take(&mut detached._uploads),
+            detached.host.take_landed_objects(),
+        ));
+        let host = detached.host;
+        host.reset();
+        let bytes = host.scratch_kept();
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+            idle.0.push(Idle(host, bytes));
+            idle.1 += bytes;
+        } else {
+            drop(idle);
+            crate::host::retire(host);
+        }
+    }
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
