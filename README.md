@@ -63,6 +63,8 @@ NVIDIA Direct3D 12 drivers enforce a hard `1,000,000` shader-visible CBV/SRV/UAV
   - Mouse-delta-to-right-stick smoothing (`VICTORY_MOUSE_LOOK=1`, `VICTORY_MOUSE_SENS=1.0`, `VICTORY_MOUSE_INVERT_Y=0`): **`F2` / Middle Mouse** locks/unlocks cursor, **`Esc` / Alt+Tab (focus loss)** unlocks, **`F7` / `F8`** adjusts sensitivity (`0.2`–`5.0`).
   - `RMB` = LT, `LMB` = RT, `X1` = B, `X2` = R3, plus 24-entry `FALLBACK_BUTTONS` keyboard mapping (`WASD` move, `Space`/`Left Shift` = A, `R`/`Backspace` = B, `X` = X, `G`/`Y` = Y, `Q`/`E` = LB/RB, `F`/`Left Ctrl` = LS, `H` = RS, `V`/`Tab` = View, `Esc` = Menu, `1`–`4` / Arrows = D-Pad).
 - **Anti-Stutter Tuning:** `VICTORY_PIPELINE_WAIT_MS=25`, `VICTORY_PIPELINE_WORKERS=4`, `VICTORY_PLACED_ORDER=1`.
+- **F3 stats panel in every build (`VICTORY_PANEL=1` shows it from the start):** frame rate and frame time, draws, how busy the GPU and the submitting thread are, copies, RAM and VRAM; the recording time is counted in `diagnostics` builds only.
+- **Water light switch (`VICTORY_WATER_LIGHT=1`):** the water's two tiled light programs (`CS_TransmissionVolumetrics_Tiled` `5dc3b25986622949`, `_Tiled_LocalLights` `6f225b641c5b0708`) are left out on 32-lane (NVIDIA) hosts, where their wave-wide form leaves whole tiles of open water dark and costs about 15 ms a frame (measured in `trustno1-coder/VIctory-NVIDIA` on an RTX 5070); `VICTORY_WATER_LIGHT=1` runs them where they translate.
 
 ### 5. Integrated Multi-Core Renderer Ports 1, 6, 7 & DirectStorage OOM Fix
 

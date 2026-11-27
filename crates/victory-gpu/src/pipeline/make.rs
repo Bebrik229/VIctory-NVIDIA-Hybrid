@@ -72,7 +72,27 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group, which a
+/// host of 32-lane waves gets in the wave-wide form only (`victory_shader::emit`). In that
+/// form they leave whole tiles of open water dark, around boats, along shores and under
+/// bridges, and take about 15 ms of the card a frame (trustno1-coder/VIctory-NVIDIA, RTX 5070:
+/// 25 fps with them, 30 without, the blocks gone). Left out there, the water has no light of
+/// its own depth (darker, bluer) and no blocks; `VICTORY_WATER_LIGHT=1` runs them where they
+/// translate.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+/// `asked`: `VICTORY_WATER_LIGHT=1`; `wave`: the host's widest wave.
+fn water_light_left_out<'a>(asked: bool, wave: u32, mut hashes: impl Iterator<Item = &'a str>) -> bool {
+    !asked && wave == 32 && hashes.any(|h| WATER_LIGHT.contains(&h))
+}
+
 fn left_out(shaders: &[Arc<Shader>], skip_hashes: &std::collections::HashSet<String>) -> Option<&'static str> {
+    static WATER_ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *WATER_ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
+    if water_light_left_out(asked, victory_shader::emit::host_settings()[0], shaders.iter().map(|s| s.hash.as_str())) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -616,6 +636,17 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_waters_tiled_light_is_left_out_on_32_lane_hosts_unless_asked() {
+        let water = ["0123456789abcdef", "6f225b641c5b0708"];
+        let other = ["0123456789abcdef"];
+        assert!(water_light_left_out(false, 32, water.into_iter()));
+        assert!(water_light_left_out(false, 32, ["5dc3b25986622949"].into_iter()));
+        assert!(!water_light_left_out(true, 32, water.into_iter()));
+        assert!(!water_light_left_out(false, 64, water.into_iter()));
+        assert!(!water_light_left_out(false, 32, other.into_iter()));
+    }
 
     #[test]
     fn initialization_producers_are_started_early_without_classifying_recurring_skinning() {
