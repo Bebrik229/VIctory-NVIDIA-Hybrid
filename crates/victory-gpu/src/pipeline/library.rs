@@ -514,6 +514,12 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Whether a failed `StorePipeline` only says the library already holds that name
+/// (`E_INVALIDARG`), as when two threads make the same pipeline at once.
+fn already_stored(e: &windows::core::Error) -> bool {
+    e.code() == windows::Win32::Foundation::E_INVALIDARG
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -577,6 +583,9 @@ pub(crate) fn pipeline(
         Ok(()) => {
             library.added.fetch_add(1, Ordering::Relaxed);
         }
+        // The name is already stored (made twice at once): the library keeps the first, so
+        // nothing is lost and the next run loads it.
+        Err(e) if already_stored(&e) => {}
         // Said, once a name: a refused store was not seen at all before, and a
         // pipeline never stored is made again by every run.
         Err(e) => {
@@ -837,6 +846,13 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_of_a_name_already_held_is_not_a_refused_store() {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
+        assert!(already_stored(&E_INVALIDARG.into()));
+        assert!(!already_stored(&E_OUTOFMEMORY.into()));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
