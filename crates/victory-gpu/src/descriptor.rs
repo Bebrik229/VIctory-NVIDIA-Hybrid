@@ -924,6 +924,7 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+#[derive(Default)]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,

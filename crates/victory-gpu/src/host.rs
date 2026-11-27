@@ -2898,6 +2898,44 @@ struct Sent {
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
 
+/// Keep each joined part's queue call and start a final call at the buffer
+/// comparison, including any timestamp lists that follow it.
+fn submission_batches<'a, T>(
+    lists: &'a [T],
+    firsts: &'a [usize],
+    parts: &'a [usize],
+    compare_at: Option<usize>,
+) -> impl Iterator<Item = &'a [T]> {
+    let ends = parts.iter().filter_map(move |&part| firsts.get(part).copied());
+    let mut from = 0;
+    ends.chain(compare_at).chain([lists.len()]).filter_map(move |to| {
+        let batch = &lists[from..to];
+        from = to;
+        (!batch.is_empty()).then_some(batch)
+    })
+}
+
+#[cfg(test)]
+mod submission_tests {
+    use super::submission_batches;
+
+    #[test]
+    fn joined_parts_run_before_the_comparison_and_end_markers() {
+        let lists = [
+            "span start", "timeline start", "first", "prelude", "second", "compare", "timeline end", "span end",
+        ];
+        let batches: Vec<_> = submission_batches(&lists, &[2, 3], &[1], Some(5)).collect();
+        assert_eq!(batches, [&lists[..3], &lists[3..5], &lists[5..]]);
+    }
+
+    #[test]
+    fn a_submission_without_comparison_keeps_the_end_markers_with_the_last_part() {
+        let lists = ["timeline start", "first", "second", "timeline end"];
+        let batches: Vec<_> = submission_batches(&lists, &[1, 2], &[1], None).collect();
+        assert_eq!(batches, [&lists[..2], &lists[2..]]);
+    }
+}
+
 /// A submission on the card that has not been waited for ([`late`]): its
 /// host lists, taken from the title's (which it may reset meanwhile), and
 /// what is to be done once it has run.
@@ -4108,12 +4146,24 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    let deferred = list.deferred();
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
+    if !deferred.texture_backs.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        for back in &deferred.texture_backs {
+            crate::texback::land(back);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::land::spent(crate::land::stat::TEXTURE_READBACK_US, began);
+            crate::land::count(crate::land::stat::TEXTURE_READBACKS, deferred.texture_backs.len() as u64);
+        }
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    #[cfg(feature = "diagnostics")]
+    let began = (!deferred.backs.is_empty()).then(std::time::Instant::now);
+    for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -4140,6 +4190,11 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(began) = began {
+        crate::land::spent(crate::land::stat::BUFFER_READBACK_US, began);
+        crate::land::count(crate::land::stat::BUFFER_READBACKS, deferred.backs.len() as u64);
     }
 }
 
@@ -5972,9 +6027,14 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        // Buffers decay to COMMON between ExecuteCommandLists calls. The
+        // compare must start a new call in case a title list promoted one
+        // to COPY_DEST. The trailing GPU timestamps still cover it.
+        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|check| {
+            let at = lists.len();
             lists.push(Some(check));
-        }
+            at
+        });
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -5992,28 +6052,31 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
-        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        let compare_at = if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
-        }
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
-            }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+                compare_at.map(|at| at + 1)
+            } else {
+                compare_at
+            };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+                for batch in submission_batches(&lists, &firsts, &parts, compare_at) {
+                    self.queue.ExecuteCommandLists(batch);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6049,18 +6112,19 @@ impl Host {
             return Some((submitted, sent));
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        let (title, comparison) = lists.split_at(compare_at.unwrap_or(lists.len()));
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
                 .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                .zip(firsts.iter().skip(1).chain([&title.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![title]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [title];
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -6068,6 +6132,9 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len() && !comparison.is_empty() {
+                    self.queue.ExecuteCommandLists(comparison);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -9973,6 +10040,12 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// PCI vendor ID of the adapter running the host device.
+    pub(crate) fn adapter_vendor_id(&self) -> Option<u32> {
+        // SAFETY: a plain query on the adapter kept with this device.
+        unsafe { self.adapter.as_ref()?.GetDesc1() }.ok().map(|desc| desc.VendorId)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

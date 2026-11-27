@@ -322,10 +322,17 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_EARLY_DEPTH=1` | pixel shaders that ask for depth testing before they run, and write no depth or stencil, get the host's early depth-stencil test (own shader cache entries) |
+| `VICTORY_LIBRARY_STATIC_SAMPLERS=1` | on NVIDIA, pipelines with static samplers are loaded from the pipeline library again (off by default: a restored one can name another process's sampler order) |
+| `VICTORY_FAULT_BOOK=<file>` | diagnostics builds: records guard write faults as `<file>.<n>.bin`; `scripts/faultbook.ps1 <file>.0.bin` summarizes faults, wait and hold time per frame |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+`cargo build --release --features mimalloc` (needs a C compiler) uses mimalloc
+as the process allocator; compare frame pacing with the default build before
+keeping it.
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
