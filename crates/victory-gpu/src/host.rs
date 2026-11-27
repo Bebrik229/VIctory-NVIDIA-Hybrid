@@ -2240,7 +2240,8 @@ mod readback_pool_tests {
             std::mem::forget((list_a, source_a, queue.clone(), fence.clone()));
             panic!("first readback fence did not complete");
         }
-        read_backs(&list_a);
+        let mut scratch = crate::texback::Scratch::default();
+        read_backs(&list_a, &mut scratch);
         assert_eq!(&dst_a[..4], &[0x1a; 4]);
 
         // The first fence did not retire the closed recording. A second
@@ -2258,8 +2259,8 @@ mod readback_pool_tests {
             panic!("second readback fence did not complete");
         }
         drop(lists);
-        read_backs(&list_a);
-        read_backs(&list_b);
+        read_backs(&list_a, &mut scratch);
+        read_backs(&list_b, &mut scratch);
         assert_eq!(&dst_a[..4], &[0x3c; 4]);
         assert_eq!(&dst_b[..4], &[0x2b; 4]);
 
