@@ -117,6 +117,15 @@ pub(crate) struct Play {
     pub(crate) title_args: Vec<String>,
 }
 
+/// Windows' own long form (`\\?\C:\...`, `\\?\UNC\server\share\...`) back
+/// to the plain one.
+fn plain(path: &str) -> String {
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    }
+}
+
 /// `%LOCALAPPDATA%\VIctory`.
 fn home() -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA").context("no %LOCALAPPDATA% to keep the cache and logs in")?;
@@ -214,8 +223,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     };
     anyhow::ensure!(exe.is_file(), "no {}", exe.display());
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // (Windows' own long form `\\?\C:\...` back to the plain one.)
-    let exe = PathBuf::from(exe.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+    let exe = PathBuf::from(plain(&exe.to_string_lossy()));
 
     let home = home()?;
     let mut s = settings(o);
@@ -312,6 +320,13 @@ mod tests {
     fn scales_are_checked() {
         assert_eq!(scale("0.67"), Ok(0.67));
         assert!(scale("0.4").is_err() && scale("x").is_err());
+    }
+
+    #[test]
+    fn long_paths_are_made_plain() {
+        assert_eq!(plain(r"\\?\C:\dump\game.exe"), r"C:\dump\game.exe");
+        assert_eq!(plain(r"\\?\UNC\nas\games\game.exe"), r"\\nas\games\game.exe");
+        assert_eq!(plain(r"D:\game.exe"), r"D:\game.exe");
     }
 
     #[test]
