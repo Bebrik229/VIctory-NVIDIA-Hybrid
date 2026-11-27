@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -167,16 +167,16 @@ fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
     at
 }
 
-/// Calls `f` with each pipeline's number and entry; where the last whole one
-/// ends.
-fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
+/// Calls `f` with where each pipeline's length prefix is and its entry; where
+/// the last whole one ends.
+fn walk_pipelines(dir: &Path, mut f: impl FnMut(u64, &[u8])) -> u64 {
     let bytes = std::fs::read(dir.join(PIPELINES)).unwrap_or_default();
-    let (mut at, mut n) = (0, 0);
+    let mut at = 0;
     while let Some(head) = bytes.get(at..at + 4) {
         let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
-        f(n, entry);
-        (at, n) = (at + 4 + size, n + 1);
+        f(at as u64, entry);
+        at += 4 + size;
     }
     at as u64
 }
@@ -191,9 +191,18 @@ pub fn count(dir: &Path) -> usize {
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
-    walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
-    });
+    walk_pipelines(dir, |_, e| all.push(recipe_key(e)));
+    all
+}
+
+fn recipe_key(entry: &[u8]) -> String {
+    entry.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Where each pipeline known in `dir` starts in the file, in the order of `keys`.
+pub fn offsets(dir: &Path) -> Vec<u64> {
+    let mut all = Vec::new();
+    walk_pipelines(dir, |at, _| all.push(at));
     all
 }
 
@@ -242,21 +251,53 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
-/// Makes the host pipelines of those of `which` (numbers in the file) and
-/// lets each go again: the driver's cache on disk keeps them. `each` is told
-/// the number before, and what came of it after: milliseconds and whether
-/// there is one.
-pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+/// A pipeline `victory warm` chose, in the file it read.
+pub struct WarmRecipe<'a> {
+    pub index: usize,
+    pub offset: u64,
+    pub key: &'a str,
+}
+
+/// Reads only the entries of `which`, in its order. The keys are checked
+/// before any is made: a file that changed since is not a bad pipeline.
+fn requested_pipelines(dir: &Path, which: &[WarmRecipe<'_>]) -> io::Result<Vec<Vec<u8>>> {
+    let mut book = std::fs::File::open(dir.join(PIPELINES))?;
+    let len = book.metadata()?.len();
+    which
+        .iter()
+        .map(|recipe| {
+            let Some(body) = recipe.offset.checked_add(4).filter(|&at| at <= len) else {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipeline recipe offset past end of book"));
+            };
+            book.seek(SeekFrom::Start(recipe.offset))?;
+            let mut head = [0; 4];
+            book.read_exact(&mut head)?;
+            let size = u32::from_le_bytes(head);
+            if u64::from(size) > len - body {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete pipeline recipe"));
+            }
+            let mut entry = vec![0; size as usize];
+            book.read_exact(&mut entry)?;
+            if recipe_key(&entry) != recipe.key {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "pipeline book changed before the worker read it"));
+            }
+            Ok(entry)
+        })
+        .collect()
+}
+
+/// Makes the host pipelines of `which` and lets each go again: the driver's
+/// cache on disk keeps them. `each` is told the number before, and what came
+/// of it after: milliseconds and whether there is one.
+pub fn make(
+    dir: &Path,
+    which: &[WarmRecipe<'_>],
+    mut each: impl FnMut(usize, Option<(f64, bool)>),
+) -> io::Result<()> {
+    let entries = requested_pipelines(dir, which)?;
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
-    let wanted: HashSet<usize> = which.iter().copied().collect();
-    let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
-        }
-    });
+    let mut file = std::fs::File::open(dir.join(SHADERS))?;
     let mut read = |hash: &[u8; 32]| {
         let &(_, at, len) = places.get(hash)?;
         let mut bytes = vec![0; len as usize];
@@ -264,15 +305,15 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         file.read_exact(&mut bytes).ok()?;
         Some(bytes)
     };
-    for n in which {
-        let Some(entry) = entries.get(n) else { continue };
-        each(*n, None);
+    for (recipe, entry) in which.iter().zip(&entries) {
+        each(recipe.index, None);
         let began = std::time::Instant::now();
         let made = parse(entry, &mut read)
             .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
             .is_some();
-        each(*n, Some((began.elapsed().as_secs_f64() * 1e3, made)));
+        each(recipe.index, Some((began.elapsed().as_secs_f64() * 1e3, made)));
     }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]
@@ -517,6 +558,38 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn a_warm_worker_reads_selected_recipes_in_request_order() {
+        let dir = std::env::temp_dir().join(format!("victory-known-selected-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        for (byte, size) in [(1, 18u32), (2, 240), (3, 51)] {
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(vec![byte; size as usize]);
+        }
+        bytes.extend(100u32.to_le_bytes()); // interrupted append
+        std::fs::write(dir.join(PIPELINES), &bytes).unwrap();
+        let (keys, offsets) = (keys(&dir), offsets(&dir));
+        assert_eq!(offsets, [0, 22, 266]);
+        assert_eq!(keys.len(), 3);
+        let request = |index: usize| WarmRecipe { index, offset: offsets[index], key: &keys[index] };
+        let which = [request(2), request(0), request(2)];
+        assert_eq!(requested_pipelines(&dir, &which).unwrap(), [vec![3; 51], vec![1; 18], vec![3; 51]]);
+
+        let mut stale = [request(0)];
+        stale[0].offset = offsets[1];
+        assert_eq!(requested_pipelines(&dir, &stale).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        stale[0].offset = (bytes.len() - 4) as u64;
+        assert_eq!(requested_pipelines(&dir, &stale).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        stale[0].offset = u64::MAX;
+        assert_eq!(requested_pipelines(&dir, &stale).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        // Nothing is reported for a set with one stale request.
+        let mut told = 0;
+        assert!(make(&dir, &[request(1), WarmRecipe { index: 0, offset: offsets[1], key: &keys[0] }], |_, _| told += 1).is_err());
+        assert_eq!(told, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

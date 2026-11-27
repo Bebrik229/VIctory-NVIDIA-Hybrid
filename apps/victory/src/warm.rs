@@ -37,6 +37,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
+    let offsets = known::offsets(&dir);
     let skipped = known::skipped(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let done = recorded_keys(&listed, &fingerprint);
@@ -81,7 +82,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     }
                     let mut rest = chunk;
                     while !rest.is_empty() {
-                        let result = child(rest, |n, ms, there| {
+                        let list: Vec<String> = rest.iter().map(|&n| worker_request(n, offsets[n], &keys[n])).collect();
+                        let result = child(rest, &list.join(","), |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
                             }
@@ -223,14 +225,14 @@ impl Progress {
 /// Has a process make `these`; how many it made, and how it ended if not well.
 fn child(
     these: &[usize],
+    list: &str,
     mut each: impl FnMut(usize, f64, bool),
 ) -> Result<(usize, Option<String>)> {
-    let list: Vec<String> = these.iter().map(usize::to_string).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
         const IDLE_PRIORITY_CLASS: u32 = 0x40;
         Command::new(exe)
-            .args(["warm", "--these", &list.join(",")])
+            .args(["warm", "--these", list])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -289,9 +291,30 @@ fn child(
     progress.finish(these.len(), Some(why))
 }
 
+/// What a worker is told of one pipeline: its number, where it is in the
+/// file and its key, so the worker reads only its own.
+fn worker_request(index: usize, offset: u64, key: &str) -> String {
+    format!("{index}:{offset}:{key}")
+}
+
+fn worker_requests(these: &str) -> Result<Vec<known::WarmRecipe<'_>>> {
+    these
+        .split(',')
+        .map(|request| {
+            let (index, details) = request.split_once(':').context("missing recipe offset in --these")?;
+            let (offset, key) = details.split_once(':').context("missing recipe key in --these")?;
+            Ok(known::WarmRecipe {
+                index: index.parse().context("--these index")?,
+                offset: offset.parse().context("--these offset")?,
+                key,
+            })
+        })
+        .collect()
+}
+
 /// What such a process does.
 fn make(dir: &Path, these: &str) -> Result<()> {
-    let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
+    let these = worker_requests(these)?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
     let mut out = std::io::stdout();
@@ -304,7 +327,8 @@ fn make(dir: &Path, these: &str) -> Result<()> {
             // Whoever asked is gone.
             std::process::exit(1);
         }
-    });
+    })
+    .context("reading the selected pipeline recipes")?;
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
@@ -313,6 +337,19 @@ fn make(dir: &Path, these: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_is_told_where_its_recipes_are() {
+        let list = [worker_request(7, 0, "aa"), worker_request(2, 4096, "bb")].join(",");
+        assert_eq!(list, "7:0:aa,2:4096:bb");
+        let back = worker_requests(&list).unwrap();
+        let seen: Vec<_> = back.iter().map(|r| (r.index, r.offset, r.key)).collect();
+        assert_eq!(seen, [(7, 0, "aa"), (2, 4096, "bb")]);
+        // The form before offsets, or a torn one, is refused before any work.
+        for bad in ["7", "7:0", "7:x:aa", "x:0:aa", "7:0:aa,"] {
+            assert!(worker_requests(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn warm_results_follow_the_translator_and_driver() {
