@@ -875,6 +875,18 @@ pub(crate) enum View {
 }
 
 impl View {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn kind_index(&self) -> usize {
+        match self {
+            Self::Constant(..) => 0,
+            Self::Shader(..) => 1,
+            Self::Unordered(..) => 2,
+            Self::Sampler(..) => 3,
+            Self::ConsoleSampler(..) => 4,
+            Self::Placed(..) => 5,
+        }
+    }
+
     /// Whether the view reads buffer memory (constant buffers, buffer views
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
@@ -915,6 +927,10 @@ impl View {
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Count slot changes so the memory log never has to walk the table.
+    /// A free slot counts toward the kind it last held until it is reused.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    kind_usage: [ViewKindUsage; 6],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -924,12 +940,29 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewKindUsage {
+    pub(crate) occupied: u64,
+    pub(crate) free: u64,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl ViewKindUsage {
+    /// Bytes in the slots themselves, excluding spare capacity and indexes.
+    pub(crate) fn slot_bytes(self) -> u64 {
+        (self.occupied + self.free) * size_of::<(View, u32)>() as u64
+    }
+}
+
 /// Read far more often than written: every slot a draw reads through a
 /// table is looked up here, on several recording threads at once in the
 /// world. Readers share it; only a view not seen before (a new table entry
 /// or shape) and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    #[cfg(all(windows, feature = "diagnostics"))]
+    kind_usage: [ViewKindUsage { occupied: 0, free: 0 }; 6],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -1063,12 +1096,30 @@ impl Views {
 
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
+    fn free_entry(&mut self, i: u32, view: &View, generation: u32) {
+        self.index.remove(view);
+        // (Below the bits that say a record is no table entry.)
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        {
+            let usage = &mut self.kind_usage[view.kind_index()];
+            usage.occupied -= 1;
+            usage.free += 1;
+        }
+        self.free.push(i);
+    }
+
     fn entry(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
                 let i = match self.free.pop() {
                     Some(i) => {
+                        #[cfg(all(windows, feature = "diagnostics"))]
+                        {
+                            let old_kind = self.list[i as usize].0.kind_index();
+                            self.kind_usage[old_kind].free -= 1;
+                        }
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -1077,6 +1128,10 @@ impl Views {
                         self.list.len() as u32 - 1
                     }
                 };
+                #[cfg(all(windows, feature = "diagnostics"))]
+                {
+                    self.kind_usage[view.kind_index()].occupied += 1;
+                }
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
@@ -1137,34 +1192,29 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// buffer views and views of placed memory (those that did not fit a
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
-/// start: constant buffer views, views of placed memory.
+/// start: constant buffer views, views of placed memory. Both the summary and
+/// the per-kind slot counts come from the same read lock.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
+pub(crate) fn views_kept() -> ([u64; 8], [ViewKindUsage; 6]) {
     use std::sync::atomic::Ordering::Relaxed;
     let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
-    [
+    let [constant, .., placed] = views.kind_usage;
+    let summary = [
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
             + views.index.len() as u64 * each * 3 / 2
             + views.shapes.capacity() as u64 * shape
             + views.shape_index.len() as u64 * shape * 3 / 2,
-        constants,
-        placed,
+        constant.occupied + constant.free,
+        placed.occupied + placed.free,
         views.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
-    ]
+    ];
+    (summary, views.kind_usage)
 }
 
 impl View {
@@ -1310,12 +1360,9 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
-        views.index.remove(&view);
-        // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
-        views.free.push(i);
+        views.free_entry(i, &view, generation);
     }
 }
 
@@ -1792,6 +1839,50 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// Each slot is counted once as it is freed and reused across kinds.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn diagnostic_counts_follow_distinct_entries_including_reused_slots() {
+        let check = |views: &Views| {
+            let mut expected = [ViewKindUsage::default(); 6];
+            for view in views.index.keys() {
+                expected[view.kind_index()].occupied += 1;
+            }
+            for &i in &views.free {
+                expected[views.list[i as usize].0.kind_index()].free += 1;
+            }
+            assert_eq!(views.kind_usage, expected);
+            assert_eq!(
+                expected.iter().map(|usage| usage.slot_bytes()).sum::<u64>(),
+                (views.list.len() * size_of::<(View, u32)>()) as u64
+            );
+        };
+        let mut views = Views::default();
+        let shader = View::Shader(1, None);
+        let [i, generation] = views.entry(shader.clone());
+        views.free_entry(i, &shader, generation);
+        assert_eq!(views.kind_usage[1], ViewKindUsage { occupied: 0, free: 1 });
+        check(&views);
+        // The freed slot, reused, changes kind.
+        let constant = View::Constant(0x1234, 256);
+        let words = views.entry(constant.clone());
+        assert_eq!(words[0], i);
+        assert_eq!(views.entry(constant.clone()), words);
+        assert_eq!(views.kind_usage[1], ViewKindUsage::default());
+        let placed = View::Placed(false, [0; 14], [0; 16]);
+        let index = views.entry(placed.clone());
+        assert_eq!(views.entry(placed), index);
+        views.entry(View::Unordered(1, 2, None));
+        views.entry(View::Sampler([0; 13]));
+        views.entry(View::ConsoleSampler([0; 27]));
+        assert_eq!(views.kind_usage.map(|usage| usage.occupied), [1, 0, 1, 1, 1, 1]);
+        check(&views);
+        views.free_entry(words[0], &constant, words[1]);
+        views.entry(View::Shader(7, None));
+        assert_eq!(views.kind_usage.map(|usage| usage.occupied), [0, 1, 1, 1, 1, 1]);
+        check(&views);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and
