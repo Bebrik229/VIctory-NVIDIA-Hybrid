@@ -1249,6 +1249,8 @@ impl<'a> Tracer<'a> {
             } = lanes.exits[q]
                 && taken != not_taken
             {
+                // (a branch on the wave's SCC tells a lane the way it went, not its own bit)
+                let when = lanes.wave_scc.get(&q).copied().unwrap_or(when);
                 known.push((when, taken == block));
             }
             let possible = self.meet(lanes, known);
@@ -1934,6 +1936,8 @@ impl<'a> Tracer<'a> {
             } = lanes.exits[q]
                 && taken != not_taken
             {
+                // (a branch on the wave's SCC tells a lane the way it went, not its own bit)
+                let when = lanes.wave_scc.get(&q).copied().unwrap_or(when);
                 known.push((when, taken == block));
             }
             let arg = if self.meet(lanes, known) {

@@ -443,6 +443,18 @@ pub struct Structured {
     /// SCC values a mask operation sets when some lane's bit of its result is set, with that
     /// lane bit: as data such an SCC is "some lane of the wave has it".
     pub scc_some: HashMap<Value, Bool>,
+    /// Blocks closed by `s_cbranch_scc0/1` on such an SCC ([`Self::scc_some`]) of an operation
+    /// that does not write EXEC, where that SCC is a lane's bit (not a count of EXEC): the
+    /// console takes the branch by the whole wave, so the lanes that follow it are not only
+    /// those whose own bit is set. With what a lane knows from
+    /// having taken it: only the way it went ([`Atom::Lane`] of the SCC value, or the
+    /// opposite), the same at every branch on that SCC. That is the wave's SCC where the
+    /// wave takes the branch and the lane's own bit where each lane still answers for itself
+    /// (pixel programs, local waves), so it does not imply the lane's bit, and EXEC stays a
+    /// guard past the branch. Either way a lane that went the way of a set SCC knows the SCC
+    /// is set (some lane's bit is, its own where it answered for itself); one that went the
+    /// other way knows nothing of the SCC as data.
+    pub wave_scc: HashMap<usize, Bool>,
 }
 
 impl Structured {
@@ -537,6 +549,11 @@ struct Lanes<'a> {
     scc_every: HashSet<Value>,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
+    /// See [`Structured::wave_scc`].
+    wave_scc: HashMap<usize, Bool>,
+    /// Per block of [`Self::wave_scc`]: its SCC as data, and whether the taken side is the
+    /// set one.
+    wave_scc_set: HashMap<usize, (Bool, bool)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -617,6 +634,8 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            wave_scc: HashMap::new(),
+            wave_scc_set: HashMap::new(),
         })
     }
 
@@ -628,6 +647,8 @@ impl<'a> Lanes<'a> {
         self.scc_lane.clear();
         self.scc_every.clear();
         self.wave_any.fill(None);
+        self.wave_scc.clear();
+        self.wave_scc_set.clear();
         self.joins.clear();
         self.phi_joins.clear();
         self.phi_join_ids.clear();
@@ -687,6 +708,10 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
+                if let Some((w, set)) = self.wave_scc_branch(last) {
+                    self.wave_scc.insert(b, w);
+                    self.wave_scc_set.insert(b, (set, last.name() == "s_cbranch_scc1"));
+                }
             }
         }
         execs
@@ -698,7 +723,12 @@ impl<'a> Lanes<'a> {
             // the wave's decision: it says nothing about this lane's own bit
             return c;
         }
-        match self.when[q] {
+        // (the way the lane went at a branch on the wave's SCC, [`Structured::wave_scc`])
+        let c = match self.wave_scc_set.get(&q) {
+            Some(&(set, on_taken)) if on_taken == taken => self.b.and(c, set),
+            _ => c,
+        };
+        match self.wave_scc.get(&q).copied().or(self.when[q]) {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
                 let nw = self.b.not(w);
@@ -861,6 +891,7 @@ impl<'a> Lanes<'a> {
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
+            wave_scc: self.wave_scc,
             scc_some: self
                 .scc_lane
                 .iter()
@@ -1357,6 +1388,29 @@ impl<'a> Lanes<'a> {
             }
             _ => None,
         }
+    }
+
+    /// See [`Self::wave_scc`].
+    fn wave_scc_branch(&mut self, inst: &Inst) -> Option<(Bool, Bool)> {
+        if !matches!(inst.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+            return None;
+        }
+        let scc = inst.read(Reg::Scc)?;
+        let &own = self.scc_lane.get(&scc)?;
+        // (a count of EXEC every running lane sees alike is no lane's bit: the branch is
+        // uniform as it is, and a lane that takes it does not show the count is not zero)
+        if self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
+            || self.scc_every.contains(&scc)
+            || self.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                i.write(Reg::Scc) == Some(scc) && i.write(Reg::S(crate::ir::EXEC)).is_some()
+            })
+        {
+            return None;
+        }
+        let born = self.born(scc);
+        let went = self.b.atom(Atom::Lane(scc), born);
+        let set = self.b.atom(Atom::Uniform(scc), born);
+        Some((if inst.name() == "s_cbranch_scc1" { went } else { self.b.not(went) }, set))
     }
 
     fn branch(&mut self, inst: &Inst) -> Bool {

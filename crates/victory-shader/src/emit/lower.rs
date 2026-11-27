@@ -1218,9 +1218,9 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
-    // A scalar select uses the condition of the whole guest wave, even
-    // when the preceding mask operation has no scalar-dword consumers.
-    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+    // A scalar select or branch uses the condition of the whole guest wave,
+    // even when the preceding mask operation has no scalar-dword consumers.
+    if matches!(i.fields, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_))
         && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
     {
         return true;
@@ -4113,6 +4113,16 @@ impl<'a> Lower<'a> {
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
+            // the way the lane went at the branches on a mask operation's SCC
+            // ([`Structured::wave_scc`]): with the wave, or by its own bit
+            Atom::Lane(v) if !self.lane_bits.contains_key(&v) && self.x.st.scc_some.contains_key(&v) => {
+                if !self.local && self.mask_data == MaskData::Console {
+                    self.scc_some(v)
+                } else {
+                    let own = self.x.st.scc_some[&v];
+                    self.boolean(own, at)
+                }
+            }
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)
@@ -4340,6 +4350,15 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
+    }
+
+    /// Whether the branch closing block `b` is one the console takes by the whole wave on the
+    /// SCC of a mask operation ([`Structured::wave_scc`]) and is lowered so ([`Self::wave_wide`]).
+    /// Not with each host wave as a wave of its own ([`with_local_waves`]), nor where the
+    /// host's waves are not the console's (pixel, vertex and mesh programs): there a lane
+    /// answers for itself, as before.
+    fn is_wave_scc_branch(&self, b: usize) -> bool {
+        !self.local && self.mask_data == MaskData::Console && self.x.st.wave_scc.contains_key(&b)
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
@@ -12680,7 +12699,7 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    _ if self.x.st.wide.contains(&b) => {
+                    _ if self.x.st.wide.contains(&b) || self.is_wave_scc_branch(b) => {
                         let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
