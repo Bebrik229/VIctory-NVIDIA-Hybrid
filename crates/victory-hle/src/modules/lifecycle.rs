@@ -110,7 +110,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +136,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -153,7 +153,25 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+///
+/// `VICTORY_MONITOR` names another monitor for the title's own top-level
+/// window: it is fitted to that monitor's work area and centred on it.
+fn fit(
+    ex_style: u32,
+    style: u32,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (i32, i32, i32, i32) {
+    if placeable(ex_style, style, !parent.is_null())
+        && let Some(area) = chosen_monitor()
+        && let Some(placed) = on_monitor(&area, width, height, window_limit())
+    {
+        tracing::info!(width, height, to = ?placed, "title window put on the monitor VICTORY_MONITOR names");
+        return placed;
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -168,6 +186,82 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// Whether a window the title makes is its own top-level window, the kind that
+/// goes onto the chosen monitor: not one with a parent or owner, not a child,
+/// not a tool window.
+fn placeable(ex_style: u32, style: u32, parented: bool) -> bool {
+    !parented && style & wm::WS_CHILD == 0 && ex_style & wm::WS_EX_TOOLWINDOW == 0
+}
+
+/// Where a window of `width` x `height` goes on the work area `area` of the
+/// chosen monitor: a size the title left to Windows (`CW_USEDEFAULT`) is
+/// first made three quarters of the area, then the size is fitted to the
+/// area and to `limit` (`VICTORY_WINDOW_MAX`) and centred. `None` for a
+/// window with no size of its own (a zero-sized helper keeps what it asked
+/// for).
+fn on_monitor(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> Option<(i32, i32, i32, i32)> {
+    let (aw, ah) = (area.right - area.left, area.bottom - area.top);
+    if aw <= 0 || ah <= 0 {
+        return None;
+    }
+    let (width, height) = if width == wm::CW_USEDEFAULT { ((aw * 3 / 4).max(1), (ah * 3 / 4).max(1)) } else { (width, height) };
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let (w, h) = fit_with_limit(area, width, height, limit);
+    Some((area.left + (aw - w) / 2, area.top + (ah - h) / 2, w, h))
+}
+
+/// The work area of the monitor `VICTORY_MONITOR` names: its device name
+/// (`DISPLAY3` or `\\.\DISPLAY3`), or its 1-based place in the order Windows
+/// lists the monitors. Unset or not found: none (the primary monitor, as
+/// before).
+fn chosen_monitor() -> Option<RECT> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    let want = std::env::var("VICTORY_MONITOR").ok()?;
+    let want = want.trim().trim_start_matches(r"\\.\").to_ascii_uppercase();
+    if want.is_empty() {
+        return None;
+    }
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `data` is the list below, alive for the enumeration.
+        let list = unsafe { &mut *(data as *mut Vec<(String, RECT)>) };
+        // SAFETY: a plain struct of numbers.
+        let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: a monitor handle from the enumeration and a sized struct.
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } != 0 {
+            let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            list.push((String::from_utf16_lossy(&info.szDevice[..end]), info.monitorInfo.rcWork));
+        }
+        1
+    }
+    let mut list: Vec<(String, RECT)> = Vec::new();
+    // SAFETY: the callback only touches `list`, which outlives the call.
+    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), (&raw mut list) as LPARAM) };
+    let found = pick_monitor(&list, &want);
+    if found.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let names: Vec<&str> = list.iter().map(|m| m.0.as_str()).collect();
+            tracing::warn!(want, ?names, "VICTORY_MONITOR names no monitor: the primary one is used");
+        });
+    }
+    found
+}
+
+/// The work area of the entry of `list` (device name, work area) that `want`
+/// (upper case, without `\\.\`) names: a 1-based place, or a device name.
+fn pick_monitor(list: &[(String, RECT)], want: &str) -> Option<RECT> {
+    match want.parse::<usize>() {
+        Ok(n) if n >= 1 => list.get(n - 1).map(|m| m.1),
+        _ => list
+            .iter()
+            .find(|(name, _)| name.trim_start_matches(r"\\.\").eq_ignore_ascii_case(want))
+            .map(|m| m.1),
+    }
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -405,6 +499,48 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A window on a monitor left of and above the primary (negative origin),
+    /// whose size the title left to Windows, with a 1280x720 cap: a default
+    /// size resolved on that monitor first, then capped and centred.
+    #[test]
+    fn a_default_sized_window_on_the_chosen_monitor_is_resolved_then_capped() {
+        let area = RECT { left: -2560, top: -200, right: 0, bottom: 1240 };
+        let default = wm::CW_USEDEFAULT;
+        assert_eq!(on_monitor(&area, default, default, Some((1280, 720))), Some((-1920, 160, 1280, 720)));
+        // Without the cap: three quarters of the work area, centred.
+        assert_eq!(on_monitor(&area, default, default, None), Some((-2240, -20, 1920, 1080)));
+        // A size of its own, larger than the cap: fitted, centred.
+        assert_eq!(on_monitor(&area, 2560, 1440, Some((1280, 720))), Some((-1920, 160, 1280, 720)));
+        // A zero-sized helper keeps what it asked for.
+        assert_eq!(on_monitor(&area, 0, 0, None), None);
+    }
+
+    /// Only the title's own top-level windows are moved.
+    #[test]
+    fn tool_child_and_owned_windows_are_not_placed() {
+        assert!(placeable(wm::WS_EX_APPWINDOW, wm::WS_OVERLAPPEDWINDOW, false));
+        assert!(!placeable(wm::WS_EX_TOOLWINDOW, wm::WS_POPUP, false));
+        assert!(!placeable(0, wm::WS_CHILD, false));
+        assert!(!placeable(0, wm::WS_OVERLAPPEDWINDOW, true));
+    }
+
+    /// `VICTORY_MONITOR`: a device name with or without its prefix, any
+    /// case, or a 1-based place; anything else names none.
+    #[test]
+    fn a_monitor_is_picked_by_name_or_place() {
+        let rect = |l: i32, w: i32| RECT { left: l, top: 0, right: l + w, bottom: 1440 };
+        let list = vec![
+            (r"\\.\DISPLAY1".to_owned(), rect(0, 3440)),
+            (r"\\.\DISPLAY3".to_owned(), rect(3440, 2560)),
+        ];
+        assert_eq!(pick_monitor(&list, "DISPLAY3").map(|m| m.left), Some(3440));
+        assert_eq!(pick_monitor(&list, "display1").map(|m| m.left), Some(0));
+        assert_eq!(pick_monitor(&list, "2").map(|m| m.left), Some(3440));
+        assert!(pick_monitor(&list, "3").is_none());
+        assert!(pick_monitor(&list, "0").is_none());
+        assert!(pick_monitor(&list, "DISPLAY2").is_none());
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 
