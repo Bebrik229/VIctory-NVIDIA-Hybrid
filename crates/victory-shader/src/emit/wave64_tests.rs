@@ -1140,3 +1140,24 @@ fn exec_selected_by_the_mask_scc_behind_its_branch_still_lowers() {
     lower::take_needs();
     local.expect("local waves");
 }
+
+/// The SCC of a count of EXEC is "some lane runs", which every running lane sees alike: the
+/// branch on it stays the uniform one it was, and a lane taking it knows nothing of the count.
+#[test]
+fn a_branch_on_the_count_of_exec_is_not_one_on_a_mask_scc() {
+    let native = native(&[
+        0xBF8C_0000, // s_waitcnt 0
+        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
+        0xBF84_0004, // s_cbranch_scc0 past the store
+        0x7E04_0282, // v_mov_b32 v2, 2
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    assert_eq!(st.scc_some.len(), 1);
+    assert!(st.wave_scc.is_empty());
+    lowered_on(&native, &p, &HashSet::new(), 64).expect("console waves");
+    lowered(&native, &p, &HashSet::new()).expect("two host waves");
+}
