@@ -45,10 +45,15 @@ struct Placement {
     size: u64,
 }
 
+static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[repr(C)]
 pub(crate) struct Heap {
     object: Object,
     desc: HeapDesc,
+    /// Identity of this heap allocation. Dynamic descriptor slot releases
+    /// carry it so a later heap reusing the same address cannot inherit them.
+    pub(crate) id: u64,
     /// The first descriptor: in `memory`, or in the title's own memory.
     pub(crate) start: u64,
     memory: Option<Memory>,
@@ -594,6 +599,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -685,10 +691,11 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
+        && unsafe { &*(heap as *const Heap) }.id == id
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
@@ -1565,6 +1572,7 @@ pub(crate) extern "system" fn create_heap(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         start,
         memory,
         #[cfg(windows)]
