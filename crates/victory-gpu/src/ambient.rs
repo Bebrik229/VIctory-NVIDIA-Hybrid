@@ -446,6 +446,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     found = any((asuint(found) & 0x7f800000u) == 0x7f800000u) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
+    // Magenta/violet garbage the probes' memory held (green far under red and
+    // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
+    // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
+    // sheet of paper in the prison cell; not an AMD-only fault.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    // And the bluer kind of it (blue over 2.5x green and over red): left as
+    // a faint violet by the line above. The sky's light keeps green above
+    // 0.4x blue, sunsets keep blue low, so neither is touched.
+    if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -745,6 +754,39 @@ mod tests {
         assert_eq!(role(b"CS_ReconstructRaymarchClassifiedNoAlpha_2d384eab"), Some(Role::March));
         assert_eq!(role(b"CS_ReconstructRaymarch_High_66f3d2a0"), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// What the raise does with the light the title's program left, as the
+    /// lines of `SOURCE` checked below have it: true when it is dropped.
+    fn dropped([r, g, b]: [f32; 3]) -> bool {
+        (g < 0.5 * r.min(b) && r.max(b) > 0.02) || (b > 2.5 * g && b > r && b > 0.02)
+    }
+
+    #[test]
+    fn violet_leftovers_are_dropped_before_the_raise() {
+        let lines = [
+            "if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;",
+            "if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;",
+        ];
+        let read = SOURCE.find("float3 was = unpack(light[p]);").expect("the read");
+        let cap = SOURCE.find("was *= min(1.0, top / max(has, 1e-6));").expect("the cap");
+        for line in lines {
+            let at = SOURCE.find(line).expect(line);
+            assert!(read < at && at < cap, "{line}");
+        }
+        // Magenta, and the bluer kind the first line leaves.
+        assert!(dropped([1.0, 0.1, 1.0]));
+        assert!(dropped([0.6, 0.05, 0.3]));
+        assert!(dropped([0.2, 0.3, 0.9]));
+        // The luminance cap alone let this through: blue weighs 0.07.
+        assert!(dropped([0.0, 0.0, 4.0]));
+        // Sky, sunset, white, a warm lamp, and what is too dark to show.
+        assert!(!dropped([0.35, 0.55, 1.0]));
+        assert!(!dropped([1.0, 0.45, 0.15]));
+        assert!(!dropped([1.0, 1.0, 1.0]));
+        assert!(!dropped([1.0, 0.8, 0.5]));
+        assert!(!dropped([0.015, 0.0, 0.015]));
+        assert!(!dropped([0.0, 0.0, 0.0]));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
