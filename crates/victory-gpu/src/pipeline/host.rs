@@ -1117,6 +1117,42 @@ mod tests {
         }
     }
 
+    /// A name the library does not have is `E_INVALIDARG`, the code the trail now calls
+    /// "not in it yet" (it was read as the library refusing the pipeline).
+    #[test]
+    fn a_name_the_library_lacks_is_invalid_arg() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return;
+        };
+        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        // SAFETY: an empty library (no blob at all, which every runtime takes), then a
+        // lookup of a name never stored with a description that names a live root signature.
+        unsafe {
+            let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
+            (Interface::vtable(&device).CreatePipelineLibrary)(
+                device.as_raw(),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut raw,
+            )
+            .ok()
+            .expect("an empty pipeline library");
+            let library = ID3D12PipelineLibrary::from_raw(raw);
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                ..Default::default()
+            };
+            let got = library.LoadComputePipeline::<_, ID3D12PipelineState>(windows::core::w!("never stored"), &desc);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            assert_eq!(got.err().map(|e| e.code()), Some(windows::Win32::Foundation::E_INVALIDARG));
+        }
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
