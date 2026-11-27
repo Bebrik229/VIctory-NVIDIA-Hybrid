@@ -19,6 +19,8 @@ pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
 mod agility;
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -145,6 +147,11 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Play: the title with this fork's settings, as a start with no
+    /// command at all does (a double click on the program beside the
+    /// title's `game_scarlett_master.exe`).
+    #[cfg(windows)]
+    Play(play::Play),
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -186,13 +193,43 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
-        return Ok(());
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some() {
+        victory_core::logging::init("info");
+        if victory_hle::modules::audio::capture::child() {
+            return Ok(());
+        }
     }
-    let cli = Cli::parse();
+    // Started with nothing after its name (a double click): play.
+    // A title that relaunches itself after such a start passes its own
+    // arguments after `--`: play again, with them.
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let bare = args.len() == 1;
+    if cfg!(windows) && args.get(1).is_none_or(|a| a == "--") {
+        args.insert(1.min(args.len()), "play".into());
+    }
+    let cli = Cli::parse_from(args);
+    // Play puts its settings into the environment and names its log file
+    // before anything else is set up.
+    #[cfg(windows)]
+    if let Command::Play(options) = &cli.command {
+        let done = play::prepare(options).and_then(|ready| {
+            agility::warn_if_runtime_missing();
+            victory_hle::runtime::set_title_args(options.title_args.clone());
+            victory_core::logging::init("info");
+            let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
+            run::run(&ready.exe, Unimplemented::Trap, false, ready.execute, console)
+        });
+        if let Err(e) = &done
+            && bare
+        {
+            eprintln!("Error: {e:#}");
+            play::hold_window();
+        }
+        return done;
+    }
+    victory_core::logging::init("info");
     match cli.command {
         Command::Inspect {
             file,
@@ -237,6 +274,8 @@ fn main() -> Result<()> {
             agility::warn_if_runtime_missing();
             warm::run(jobs, limit, again, used, list_no_host, these)
         }
+        #[cfg(windows)]
+        Command::Play(_) => unreachable!("handled above"),
         Command::Run {
             exe,
             unimplemented,
