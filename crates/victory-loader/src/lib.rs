@@ -28,6 +28,7 @@ mod crash;
 mod hooks;
 #[cfg(windows)]
 pub mod frame_rate;
+pub mod heartbeat;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolution;
