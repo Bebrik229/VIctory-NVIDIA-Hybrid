@@ -250,6 +250,13 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_SKIP_BINK=1` to skip the title's Bink movies that play once
+(logos, the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too
+(menu backgrounds then stay dark). A skipped movie is put on its last frame
+and none of it is decoded, so the title's own end-of-movie check ends it at
+once. With the variable unset or `0`, no import is rebound and movies play
+as before.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
