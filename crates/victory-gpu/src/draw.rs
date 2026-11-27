@@ -3710,11 +3710,16 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let (view, deferred) = crate::residency::upload_deferred_during(|| {
+            let view = host.mirror(index, handle, true)?;
             readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
+            Some(view)
+        });
+        if let Some(view) = view {
+            // Up to date by this draw: not the texture pass's to make,
+            // unless its backing or upload was deferred.
             if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
+                host.texture_slot_tabled(index, !deferred);
             } else {
                 host.slot_tabled(index);
             }
