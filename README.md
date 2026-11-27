@@ -12,10 +12,11 @@
 
 - **Прорыв через лимит дескрипторов NVIDIA 1M+ (`SLOT_REMAP` `t251` + 3 банка):** виртуально-физическая переадресация слотов с grace-рекламацией и clock-вытеснением даёт **`0` ошибок нехватки дескрипторов** на `44M+` живых записях.
 - **Шейдеры полностью работают + фикс ч/б картинки на NVIDIA:** `28,562` предкомпилированных шейдеров (`PORT_CBV=0 + SLOT_REMAP=1`), релизный `VICTORY_SKIP_PIPELINES` (`1,034` RT-off хэшей), а также найден и устранён баг с нулевыми CBV (`descriptor/host.rs`: защита `twin.is_some()` + `VICTORY_PORT_CBV=0` при `raw_twins=false`). **Полная цветность подтверждена прямым захватом backbuffer GPU в 2K открытом мире.**
-- **Нативные D3D12-барьеры (`VICTORY_NATIVE_BARRIERS=1`):** отслеживание `uav_dirty` / `budget_dirty` по каждому `HostList`, разбор `D3D12_BARRIER_GROUP` с пропуском read-only переходов и точечные `uav_barrier_for(&res)` / `D3D12_BUFFER_BARRIER` (в живом 2K-прогоне: `429,175` отправлено / `213,931` отброшено / `500,617` точечных / `43,770` group-skipped).
-- **Плавный Mouse Look + анти-статтер + Ports 1, 6, 7:** аналоговое управление мышью и 24 ПК-клавиши (`gameinput.rs`), многопоточные порты рендерера `1, 6, 7`, фикс утечки памяти DirectStorage.
+- **Нативные D3D12-барьеры (`VICTORY_NATIVE_BARRIERS=targeted` по умолчанию):** отслеживание `uav_dirty` / `budget_dirty` по каждому `HostList`, разбор `D3D12_BARRIER_GROUP` и точечные `uav_barrier_for(&res)` / `D3D12_BUFFER_BARRIER` без засвета/ч/б-артефактов (`1` также поддерживается опционально).
+- **Волна CPU/RT-оптимизаций (`PORT_RT=1`, `REAPER=1`, `COPY_AHEAD=1`, `PRELUDE_POOL=1`, `SECTION_MB=2`, `THIN_THREADS=12`, `RT_SKIP_DEAD=1`, `BVH_NO_HIT=1`, `HAIR=0`, Wave B):** асинхронный `reaper` убрал `73.5–153.7 ms/f` дропов объектов с submit-потока, `0.0 ms` ожидания флайтов и GPU, а в `run-nvidia-fast.ps1` выставлен `VICTORY_PORT_CONSTANTS=0` (A/B на RTX 5070: `PORT_CONSTANTS=1` + `SECTION_MB=0` ронял FPS с `18.1` до `8.8`).
+- **Совместимость с VILauncher (`.\D3D12\`):** `victory.exe` экспортирует стандартный `D3D12SDKPath = ".\D3D12\"` (плюс авто-фоллбек копирования из `d3d12sdk\`) и работает в виде готовой standalone-сборки.
 - **Проверенный FPS (NVIDIA RTX 5070 12 GB, Ryzen 7 7800X3D, 32 GB RAM):**
-  - `1080p` `Series S` (`Scale=0.5`): **`11.6–16.0 fps`** (медиана **`~14.5 fps`**, стабильно **`15.3–16.0 fps` / `62.5–65.5 ms`**, с NVIDIA Smooth Motion 2x ощущается как **`~29–32 fps`**).
+  - `1080p` `Series S` (`Scale=0.5`, актуальный билд): **`11.6–19.7 fps`**, медиана **`18.1 fps`** (`50.9–86.4 ms/f`, GPU `86%`, VRAM `7.8 GB`, `0.0 ms` GPU/flight waits).
   - `2K` (`2560x1440`) `Series X` (`Scale=0.67`, полный цвет, `PORT_CBV=0`): медиана **`7.9 fps`** (**`7.6–8.5 fps`**, `118–132 ms/f`, `0` OOM, `0` descriptor cap).
   - `2K` нативный (`2560x1440`) `Series X` (`Scale=1.0`): **`4.7–5.3 fps`** (`190–211 ms/f`, `9.99 GB` VRAM, `0` крашей).
 
@@ -54,7 +55,7 @@ NVIDIA Direct3D 12 drivers enforce a hard `1,000,000` shader-visible CBV/SRV/UAV
   - **Enhanced Barrier parser (`D3D12_BARRIER_GROUP`):** `enhanced_barrier::parse` / `needs_uav_bool` in `list.rs` (packed into thin command streams via `pack_barrier_groups` in `list/thin.rs`) skips pure read-only transitions (`GroupSync::None`) while preserving synchronization for `ACCESS_COMMON`, `UNORDERED_ACCESS`, `RENDER_TARGET`, `DEPTH_STENCIL_WRITE`, `COPY_DEST`, `RESOLVE_DEST`, `STREAM_OUTPUT`, and `RAYTRACING_ACCELERATION_STRUCTURE_WRITE`.
   - **Targeted barriers:** `uav_barrier_for(&res)` and Enhanced `D3D12_BUFFER_BARRIER` (`buf_barrier` / `buffer_barriers` in `host/place.rs`) replace global `UAV_BARRIER(NULL)` and `wait_for_all` in indirect clamping, card steps, placed copies, and readback compare passes.
   - **Live 2K observed counters:** `emitted=429,175`, `elided=213,931`, `targeted=500,617`, `group_skipped=43,770`.
-  - Modes: `1` (default, targeted barriers + title read-only elision), `targeted` (targeted host barriers, no title barrier elision), `0` (legacy global barriers).
+  - Modes: `2` / `targeted` (default, targeted host barriers without title barrier elision — prevents NVIDIA blowout), `1` (targeted barriers + title read-only elision), `0` (legacy global barriers).
 
 ### 4. Release `VICTORY_SKIP_PIPELINES`, Smooth Mouse Look & Anti-Stutter Tuning
 
@@ -69,7 +70,7 @@ NVIDIA Direct3D 12 drivers enforce a hard `1,000,000` shader-visible CBV/SRV/UAV
 ### 5. Integrated Multi-Core Renderer Ports 1, 6, 7 & DirectStorage OOM Fix
 
 Integrated from `DoubleGhosty/cool_fox` (`Esteban Viera`, `Xyzstk`, `DoubleGhosty`, `Duff`, `fxceless`):
-- **Port 1 (`VICTORY_PORT_CONSTANTS=1`):** raw constant buffer reads (Port 5 `VICTORY_PORT_CBV=0` is disabled on NVIDIA 1M-capped heaps and guarded by `twin.is_some()` in `descriptor/host.rs`).
+- **Port 1 (`VICTORY_PORT_CONSTANTS=0` default in launcher):** raw in-place constant buffer reads can be opted into (`=1` with `SECTION_MB=0`), but A/B benchmarking on RTX 5070 showed `8.8 fps` (`GPU 16%`) vs `18.1 fps` (`GPU 86%`) without it, so `run-nvidia-fast.ps1` disables it by default. Port 5 `VICTORY_PORT_CBV=0` is disabled on NVIDIA 1M-capped heaps and guarded by `twin.is_some()` in `descriptor/host.rs`.
 - **Port 6 (`VICTORY_PORT_GUARD=1`, `VICTORY_PORT_GUARD_PLAN=1`):** shared guard lock across faults/refreshes and parallel submission refresh planning.
 - **Port 7 (`VICTORY_PORT_JOURNAL=1`):** partitioned journal tracking and early descriptor sync.
 - **DirectStorage memory fix (`6d8c299`):** compressed bytes freed once inflated; walls trace file list retained only when tracing is enabled.
@@ -88,10 +89,11 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 | `vicky-cgbj` Ports 1, 5, 6, 7 | 1080p, `Series S` | `11.4 fps` median (`87.5 ms`, peak `13.1 fps`) | `GPU 47.2 ms` |
 | **`VIctory-NVIDIA-Hybrid` + Native Barriers (pre-PR #1/`#26`)** | **1080p `Scale=0.5`, `Series S`** | **`11.6–16.0 fps`** (median **`~14.5 fps`**, steady **`15.3–16.0 fps` / `62.5–65.5 ms`**) | `5.1k–5.7k draws/f`, `GPU wait 0.0–10.4 ms`, **`0` OOM, `0` descriptor cap** (`~29–32 fps` perceived with NVIDIA Smooth Motion 2x) |
 | **`VIctory-NVIDIA-Hybrid` Latest (`#12`/`#21`/`#32`/`#35`/`#37`/`#44`/`#46`, Full Color)** | **1080p `Scale=0.5`, `Series S`** | **`9.3–16.1 fps`** (`62.0–107.1 ms/f`: `13.0–16.1 fps` open outdoor, `9.3–10.1 fps` `4.4k` draws dock/interior) | **CPU `preparing` cut to `18.0–20.5 ms`**, **`96–97%` GPU utilization**, `0` OOM, `0` descriptor cap |
+| **`VIctory-NVIDIA-Hybrid` Hybrid Release (`PORT_RT`, `REAPER`, `COPY_AHEAD`, `SECTION_MB=2`, `PORT_CONSTANTS=0`, `.\D3D12\`)** | **1080p `Scale=0.5`, `Series S`** | **`11.6–19.7 fps` (median `18.1 fps`)** | `reaper` offloads `73.5–153.7 ms/f` drops, **`0.0 ms` GPU/flight waits**, `86%` GPU (`7.8 GB` VRAM); A/B `SECTION_MB=0 + PORT_CONSTANTS=1` = `8.8 fps` median |
 | **`VIctory-NVIDIA-Hybrid` 2K Full Color** | **`Series X`, `2560x1440`, `Scale=0.67`, `PORT_CBV=0`** | **`7.9 fps` median** (`7.6–8.5 fps`, `118–132 ms/f`) | `8,220 draws/f`, `22.89 GB WS`, `20.87 GB Commit`, **`0` OOM, `0` descriptor cap, full color verified** |
 | `VIctory-NVIDIA-Hybrid` Native 2K | `Series X`, `2560x1440`, `Scale=1.0` | `4.7–5.3 fps` (`190–211 ms/f`) | `12.4k–13.0k draws/f`, `9.99 GB` VRAM, `0` crashes |
 
-> **Tip for 12 GB RTX cards:** Default `run-nvidia-fast.ps1` uses `-Console series-s -Output 1920x1080 -Scale 0.5` for maximum fluidity (`~14.5–16.0 fps`, or `~29–32 fps` with `-SmoothMotion`). For 2K (`2560x1440`), always use `-Console series-x -Output 2560x1440 -Scale 0.67` (`series-s` allocates a smaller back-buffer pool sized for 1080p).
+> **Tip for 12 GB RTX cards:** Default `run-nvidia-fast.ps1` uses `-Console series-s -Output 1920x1080 -Scale 0.5` (`~18.1 fps` median, `~36 fps` perceived with `-SmoothMotion`) and sets `VICTORY_PORT_CONSTANTS=0` + `VICTORY_NATIVE_BARRIERS=targeted`. For 2K (`2560x1440`), always use `-Console series-x -Output 2560x1440 -Scale 0.67` (`series-s` allocates a smaller back-buffer pool sized for 1080p).
 
 ---
 
@@ -111,6 +113,8 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
 - **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
 - **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + CPU/relay optimization wave (`#12`, `#13`, `#21`, `#28`, `#32`, `#35`, `#37`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, allocation-free write-watch shard walk (`#35`), uncovered-only title memory zeroing (`#28`), readback scratch/range merge reuse (`#32`) + pooled readback buffers (`VICTORY_READBACK_POOL=1`, `#12`), early relay command list recycling (`VICTORY_RECYCLE_LANDED_EARLY=1`, `#21`), batched CBV fill planning (`#37`), single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
+- **CPU/RT optimization wave & Wave B (`083f141` / `e8158e9` / `1692172`):** ported `VICTORY_PORT_RT=1`, `VICTORY_REAPER=1` + `VICTORY_COPY_AHEAD=1`, `VICTORY_PRELUDE_POOL=1`, `VICTORY_SECTION_MB=2`, `VICTORY_THIN_THREADS=12`, `VICTORY_RT_SKIP_DEAD=1` + `VICTORY_BVH_NO_HIT=1`, `VICTORY_HAIR=0` default, Wave B `watch`/`host`/`shadow` micro-optimizations, `VICTORY_NATIVE_BARRIERS=targeted` default, and standard `.\D3D12\` Agility SDK path export (`d3d12sdk\` fallback included).
+- **Standalone bundle or repo checkout:** `scripts/run-nvidia-fast.ps1` works both from a cloned cargo build (`target\release\victory.exe`) and directly from an extracted release zip (`victory.exe` beside `scripts\` and `D3D12\`).
 - **Indoor haze & froxel clamp (`#31`):** `VICTORY_AMBIENT_MARCH=1` clamps ray-marched in-scatter (`4,096`-view ring) to room luminance alongside constant-mode air clamp and NaN/Inf froxel scrubbing (`run-nvidia-fast.ps1` sets `VICTORY_AMBIENT=0.6`, `VICTORY_AMBIENT_AIR=1.0`, `VICTORY_AMBIENT_MARCH=1`; dark interiors can also try `VICTORY_AMBIENT=constant:0.35`).
 
 ---

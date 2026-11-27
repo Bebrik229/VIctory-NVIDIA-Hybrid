@@ -23,11 +23,16 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $LocalRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$ExePath = $null
 if (-not $RepoRoot) {
+    $standaloneExe = Join-Path $LocalRepoRoot 'victory.exe'
     $localExe = Join-Path $LocalRepoRoot 'target\release\victory.exe'
     $fallbackRepo = 'D:\gta6-re\vicky-cgbj'
     $fallbackExe = Join-Path $fallbackRepo 'target\release\victory.exe'
-    if (Test-Path $localExe) {
+    if (Test-Path $standaloneExe) {
+        $RepoRoot = $LocalRepoRoot
+        $ExePath = $standaloneExe
+    } elseif (Test-Path $localExe) {
         $RepoRoot = $LocalRepoRoot
     } elseif (Test-Path $fallbackExe) {
         $RepoRoot = $fallbackRepo
@@ -39,7 +44,9 @@ if (-not $RepoRoot) {
     $RepoRoot = (Resolve-Path $RepoRoot).Path
 }
 
-$ExePath = Join-Path $RepoRoot 'target\release\victory.exe'
+if (-not $ExePath) {
+    $ExePath = Join-Path $RepoRoot 'target\release\victory.exe'
+}
 $HashesFile = Join-Path $LocalRepoRoot 'scripts\rt_off_hashes.txt'
 if (-not (Test-Path $HashesFile)) {
     $HashesFile = Join-Path $RepoRoot 'scripts\rt_off_hashes.txt'
@@ -193,7 +200,7 @@ $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
 $env:VICTORY_CARD_BUFFERS_MB = '1536'
 $env:VICTORY_COMPOSE = '1'
 $env:VICTORY_WAIT_RESIDENT = '0'
-$env:VICTORY_PORT_CONSTANTS = if ($env:VICTORY_PORT_CONSTANTS) { $env:VICTORY_PORT_CONSTANTS } else { '1' }
+$env:VICTORY_PORT_CONSTANTS = if ($env:VICTORY_PORT_CONSTANTS) { $env:VICTORY_PORT_CONSTANTS } else { '0' } # RTX 5070 A/B: PORT_CONSTANTS=1 drops 18.1 -> 8.8 fps
 $env:VICTORY_PORT_CBV = '0' # NVIDIA 1M view-heap cap forces raw_twins=false; PORT_CBV=1 nulls non-256B CBVs -> B&W
 $env:VICTORY_PORT_GUARD = '1'
 $env:VICTORY_PORT_GUARD_PLAN = '1'
@@ -236,7 +243,7 @@ if ($SmoothMotion) {
     $LaunchExe = $smPath
 }
 
-Write-Host "[run-nvidia-fast] Mode: $mode | Console: $Console | Output: $($env:VICTORY_OUTPUT) | Scale: $($env:VICTORY_RENDER_SCALE) | NativeBarriers: $($env:VICTORY_NATIVE_BARRIERS) | Ports: 1,6,7 (PORT_CBV=0) | SmoothMotion: $($SmoothMotion.IsPresent) | SkipPipelines: $($hashes.Count) | Mouse: F2/MMB lock, Esc unlock, F7/F8 sens ($($env:VICTORY_MOUSE_SENS)) | Cache: $CacheDir | Log: $LogPath"
+Write-Host "[run-nvidia-fast] Mode: $mode | Console: $Console | Output: $($env:VICTORY_OUTPUT) | Scale: $($env:VICTORY_RENDER_SCALE) | NativeBarriers: $($env:VICTORY_NATIVE_BARRIERS) | Ports: 6,7,RT (PORT_CONSTANTS=$($env:VICTORY_PORT_CONSTANTS), PORT_CBV=0, SECTION_MB=$($env:VICTORY_SECTION_MB)) | SmoothMotion: $($SmoothMotion.IsPresent) | SkipPipelines: $($hashes.Count) | Mouse: F2/MMB lock, Esc unlock, F7/F8 sens ($($env:VICTORY_MOUSE_SENS)) | Cache: $CacheDir | Log: $LogPath"
 
 $argList = @('run')
 if (-not $DryRun) { $argList += '--execute' }
