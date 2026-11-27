@@ -1965,7 +1965,6 @@ fn workers() -> &'static Workers {
                 let mut priority = crate::cores::Priority::new();
                 let workers = WORKERS.get().expect("made above");
                 loop {
-                    priority.keep();
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -1979,6 +1978,7 @@ fn workers() -> &'static Workers {
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
+                    priority.keep();
                     let _working = crate::timeline::span("a job for another thread");
                     job();
                 }
