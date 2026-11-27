@@ -37,6 +37,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
+    let skipped = known::skipped(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
     let mut done: HashSet<&str> = HashSet::new();
     for line in listed.lines() {
@@ -54,7 +55,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
+            let skipped = skipped.get(n).copied().unwrap_or(false);
+            !skipped && (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
@@ -62,10 +64,11 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}), {} bad, {} skipped by VICTORY_SKIP_PIPELINES; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),
+        skipped.iter().filter(|&&s| s).count(),
         all.len()
     );
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
@@ -89,7 +92,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            if count.is_multiple_of(1000) {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);

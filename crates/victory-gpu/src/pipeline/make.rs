@@ -72,7 +72,27 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, GTA VI 1.0.2.1): programs of one 64-lane wave a group, which a
+/// host of 32-lane waves gets in the wave-wide form only (`victory_shader::emit`). In that
+/// form they leave whole tiles of open water dark, around boats, along shores and under
+/// bridges, and take about 15 ms of the card a frame (trustno1-coder/VIctory-NVIDIA, RTX 5070:
+/// 25 fps with them, 30 without, the blocks gone). Left out there, the water has no light of
+/// its own depth (darker, bluer) and no blocks; `VICTORY_WATER_LIGHT=1` runs them where they
+/// translate.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+/// `asked`: `VICTORY_WATER_LIGHT=1`; `wave`: the host's widest wave.
+fn water_light_left_out<'a>(asked: bool, wave: u32, mut hashes: impl Iterator<Item = &'a str>) -> bool {
+    !asked && wave == 32 && hashes.any(|h| WATER_LIGHT.contains(&h))
+}
+
+fn left_out(shaders: &[Arc<Shader>], skip_hashes: &std::collections::HashSet<String>) -> Option<&'static str> {
+    static WATER_ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *WATER_ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"));
+    if water_light_left_out(asked, victory_shader::emit::host_settings()[0], shaders.iter().map(|s| s.hash.as_str())) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -96,6 +116,9 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    if super::skipped_in_list(shaders, skip_hashes).is_some() {
+        return Some("skipped by VICTORY_SKIP_PIPELINES");
     }
     None
 }
@@ -124,6 +147,14 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        Self::new_with_skip_hashes(shaders, graphics, super::skip_hashes())
+    }
+
+    fn new_with_skip_hashes(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        skip_hashes: &std::collections::HashSet<String>,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -135,7 +166,7 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let left_out = left_out(&shaders, skip_hashes);
         Pending {
             screen,
             scene_input,
@@ -176,7 +207,7 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.unwrap_or("being made").into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -607,6 +638,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_waters_tiled_light_is_left_out_on_32_lane_hosts_unless_asked() {
+        let water = ["0123456789abcdef", "6f225b641c5b0708"];
+        let other = ["0123456789abcdef"];
+        assert!(water_light_left_out(false, 32, water.into_iter()));
+        assert!(water_light_left_out(false, 32, ["5dc3b25986622949"].into_iter()));
+        assert!(!water_light_left_out(true, 32, water.into_iter()));
+        assert!(!water_light_left_out(false, 64, water.into_iter()));
+        assert!(!water_light_left_out(false, 32, other.into_iter()));
+    }
+
+    #[test]
     fn initialization_producers_are_started_early_without_classifying_recurring_skinning() {
         let pending = |stage: &'static str, text: &[u8]| {
             // Real containers identify their stage. Keep the synthetic
@@ -755,5 +797,51 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
+        let shader = |hash: &str| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: hash.to_owned(),
+                container: Vec::new(),
+                hair: false,
+                ambient: None,
+                translated: OnceLock::from(None),
+            })
+        };
+        let skips: std::collections::HashSet<String> =
+            super::super::parse_skip_hashes("32ed072b9f845048").into_iter().collect();
+
+        let skipped = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("32ed072b9f845048")],
+            None,
+            &skips,
+        ));
+        assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
+        early(&skipped);
+        assert!(ready(&skipped).is_none());
+        assert_eq!(skipped.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(skipped.made.get().is_none());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&skipped).as_deref(),
+            Some("skipped by VICTORY_SKIP_PIPELINES")
+        );
+
+        let normal = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("0011223344556677")],
+            None,
+            &skips,
+        ));
+        assert_eq!(normal.left_out, None);
+        assert!(ready(&normal).is_none());
+        assert_ne!(normal.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while normal.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(matches!(normal.made.get(), Some(None)));
     }
 }

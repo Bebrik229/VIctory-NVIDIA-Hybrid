@@ -197,11 +197,10 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
-/// Temporary pixels and the layouts reused by one thread returning textures.
+/// Temporary pixels reused by one thread returning textures.
 #[derive(Default)]
 pub(crate) struct Scratch {
     pixels: Vec<u8>,
-    tiling: victory_formats::texture::TilingCache,
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -242,8 +241,7 @@ pub(crate) fn land(back: &Back, scratch: &mut Scratch) {
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        let pitches = (pitch, pitch * rows as usize);
-        if let Err(e) = scratch.tiling.tile(&back.layout, tiled, (mip, slice), linear, pitches) {
+        if let Err(e) = back.layout.tile(tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
