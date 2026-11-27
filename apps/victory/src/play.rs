@@ -111,6 +111,10 @@ pub(crate) struct Play {
     /// Add or override a switch, as often as needed: `--set VICTORY_X=1`.
     #[arg(long = "set", value_name = "NAME=VALUE")]
     more: Vec<String>,
+    /// Arguments for the title, after `--` (a title that relaunches itself
+    /// passes some).
+    #[arg(last = true)]
+    pub(crate) title_args: Vec<String>,
 }
 
 /// `%LOCALAPPDATA%\VIctory`.
@@ -265,6 +269,7 @@ mod tests {
             quality: false,
             dry_run: false,
             more: Vec::new(),
+            title_args: Vec::new(),
         }
     }
 

@@ -196,13 +196,20 @@ fn main() -> Result<()> {
         }
     }
     // Started with nothing after its name (a double click): play.
-    let bare = std::env::args_os().len() == 1;
-    let cli = if bare && cfg!(windows) { Cli::parse_from(["victory", "play"]) } else { Cli::parse() };
+    // A title that relaunches itself after such a start passes its own
+    // arguments after `--`: play again, with them.
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let bare = args.len() == 1;
+    if cfg!(windows) && args.get(1).is_none_or(|a| a == "--") {
+        args.insert(1.min(args.len()), "play".into());
+    }
+    let cli = Cli::parse_from(args);
     // Play puts its settings into the environment and names its log file
     // before anything else is set up.
     #[cfg(windows)]
     if let Command::Play(options) = &cli.command {
         let done = play::prepare(options).and_then(|ready| {
+            victory_hle::runtime::set_title_args(options.title_args.clone());
             victory_core::logging::init("info");
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, ready.execute, console)
