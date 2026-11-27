@@ -141,6 +141,12 @@ cargo build --release -j 1 -p victory
 target\release\victory.exe shaders <path-to-shader-archives>
 ```
 
+`scripts\play.ps1` does this by itself: when the shader cache contains fewer
+than 1,000 stored translations, it runs `victory shaders` before launching the
+title. It scans the configured game directory when available, or the
+executable's directory. The driver may still build pipelines during the first
+run. Use `-SkipShaders` to skip the translation step.
+
 ---
 
 ## Repository

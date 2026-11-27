@@ -2,6 +2,7 @@
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -SkipShaders  start even when the shader cache is cold (otherwise every shader is translated first)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -9,6 +10,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$SkipShaders,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -28,11 +30,34 @@ foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
-if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { Write-Host "No $Exe."; return }
 # (Other settings left over in this window go; where your files are stays.)
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
-$Exe = (Resolve-Path $Exe).Path
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try {
+    if (-not $SkipShaders) {
+        $config = & $victory config
+        if ($LASTEXITCODE -eq 0) {
+            $cache = $config | Select-String '^cache_dir\s*:\s*(.+)$' | Select-Object -First 1
+            if ($cache) {
+                $shaders = Join-Path $cache.Matches[0].Groups[1].Value 'shaders'
+                $entries = Get-ChildItem -LiteralPath $shaders -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -cmatch '^[0-9a-f]{62}$' } | Select-Object -First 1000
+                if (@($entries).Count -lt 1000) {
+                    $source = Split-Path -LiteralPath $Exe
+                    $game = $config | Select-String '^game_dir\s*:\s*(.+)$' | Select-Object -First 1
+                    if ($game -and (Test-Path -LiteralPath $game.Matches[0].Groups[1].Value -PathType Container)) {
+                        $source = $game.Matches[0].Groups[1].Value
+                    }
+                    Write-Host "The shader cache has fewer than 1,000 entries. Translating shaders before launch. Use -SkipShaders to start without this step."
+                    & $victory shaders $source
+                    if ($LASTEXITCODE -ne 0) { Write-Host "victory shaders ended with exit code $LASTEXITCODE; starting anyway." }
+                }
+            }
+        }
+    }
+    & $victory run $Exe --execute
+} finally { Pop-Location }
