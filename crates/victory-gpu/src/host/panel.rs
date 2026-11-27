@@ -50,14 +50,21 @@ fn shown() -> &'static AtomicBool {
 fn pressed() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
     // SAFETY: a plain query.
-    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
-    if DOWN.swap(down, Ordering::Relaxed) || !down {
+    let state = unsafe { GetAsyncKeyState(i32::from(VK_F3)) };
+    if !newly_pressed(DOWN.swap(state < 0, Ordering::Relaxed), state) {
         return false;
     }
     let mut process = 0;
     // SAFETY: plain queries; room for the answer.
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
     process == std::process::id()
+}
+
+/// A press this call has not counted yet. The low bit of the key's state
+/// says it went down since the last call, which catches a tap that began and
+/// ended between two frames.
+fn newly_pressed(was_down: bool, state: i16) -> bool {
+    !was_down && (state < 0 || state & 1 != 0)
 }
 
 /// Seven rows of five dots, the leftmost the highest bit.
@@ -470,6 +477,19 @@ mod tests {
     }
 
     /// The line names the recording time only where it is counted, and fits the box.
+    #[test]
+    fn a_tap_between_two_frames_counts_once() {
+        let (up, held, tapped, pressed) = (0, i16::MIN, 1, i16::MIN | 1);
+        assert!(newly_pressed(false, pressed));
+        assert!(newly_pressed(false, held));
+        assert!(newly_pressed(false, tapped));
+        assert!(!newly_pressed(true, held));
+        assert!(!newly_pressed(true, pressed));
+        assert!(!newly_pressed(true, up));
+        assert!(!newly_pressed(true, tapped));
+        assert!(!newly_pressed(false, up));
+    }
+
     #[test]
     fn the_copies_line_fits_every_build() {
         let line = copies(12e6, 3400.0);
