@@ -19,6 +19,7 @@ pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
 mod agility;
 mod census;
 mod inspect;
+mod memcmp;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
