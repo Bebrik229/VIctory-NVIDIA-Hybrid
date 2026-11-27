@@ -1263,6 +1263,10 @@ pub(crate) struct LandedObjects {
     _states: States,
     _twins: std::collections::HashMap<usize, TwinUse>,
     _coming: Option<(usize, std::sync::Arc<aside::Coming>)>,
+    /// The scratch chunks the recording filled, given to the next list
+    /// (or freed) only once the lag is over; left with the list when lists
+    /// keep their own chunks (`VICTORY_SCRATCH_POOL=0`).
+    _scratch: Scratch,
 }
 
 /// What a list does with a depth texture that has a colour twin
@@ -3565,6 +3569,26 @@ mod landed_tests {
         list.reset();
         assert_eq!(held._deferred.kept.len(), 1);
         assert!(list.deferred().kept.is_empty());
+    }
+
+    /// The scratch memory a landed list's commands read stays out of the
+    /// spare chunks until what the list held is dropped.
+    #[test]
+    fn landed_scratch_is_not_shared_before_the_lag() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if !super::scratch_pool() {
+            return;
+        }
+        let mut list = host.new_list().expect("host list");
+        list.scratch(64).expect("scratch memory");
+        assert!(list.scratch_kept() > 0);
+        let held = list.take_landed_objects();
+        assert_eq!(list.scratch_kept(), 0);
+        assert_eq!(held._scratch.chunks.len(), 1);
+        list.reset();
+        assert_eq!(held._scratch.chunks.len(), 1);
     }
 }
 
@@ -6688,6 +6712,11 @@ impl HostList {
             _states: std::mem::take(self.states.get_mut().unwrap_or_else(|e| e.into_inner())),
             _twins: std::mem::take(self.twins.get_mut().unwrap_or_else(|e| e.into_inner())),
             _coming: self.coming.get_mut().unwrap_or_else(|e| e.into_inner()).take(),
+            _scratch: if scratch_pool() {
+                std::mem::take(self.scratch.get_mut().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                Scratch::default()
+            },
         }
     }
 
