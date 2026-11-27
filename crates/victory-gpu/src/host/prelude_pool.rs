@@ -2,7 +2,6 @@ use super::{Host, Prelude, host, lazy_prelude};
 use std::sync::{Mutex, OnceLock};
 
 const IDLE_LIMIT: usize = 128;
-const PRESSURED_LIMIT: usize = 16;
 
 pub(super) struct Pool<T = Prelude>(Mutex<Vec<T>>);
 
@@ -34,26 +33,12 @@ impl<T> Pool<T> {
         }
     }
 
-    fn give(&self, prelude: T, limit: usize) {
+    fn give(&self, prelude: T) {
+        // Retaining the bounded set avoids recreating command memory on
+        // every batch while host RAM pressure persists.
         let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.len() < limit {
+        if idle.len() < IDLE_LIMIT {
             idle.push(prelude);
-        }
-    }
-
-    fn trim_to(&self, keep: usize) {
-        let excess = {
-            let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            let keep = idle.len().min(keep);
-            idle.split_off(keep)
-        };
-        // Release command memory after dropping the lock.
-        drop(excess);
-    }
-
-    pub(super) fn trim_for_pressure(&self) {
-        if enabled() {
-            self.trim_to(PRESSURED_LIMIT);
         }
     }
 }
@@ -80,15 +65,6 @@ impl Slot {
         self.record_with(pool, make, record)
     }
 
-    /// Called after the list's previous submission has finished and it has reset.
-    pub(super) fn recycle(&self, pool: &Pool) {
-        let limit = if crate::residency::pressured() {
-            PRESSURED_LIMIT
-        } else {
-            IDLE_LIMIT
-        };
-        self.recycle_capped(pool, limit);
-    }
 }
 
 impl<T> Slot<T> {
@@ -110,11 +86,12 @@ impl<T> Slot<T> {
         }
     }
 
-    fn recycle_capped(&self, pool: &Pool<T>, limit: usize) {
+    /// Called after the list's previous submission has finished and it has reset.
+    pub(super) fn recycle(&self, pool: &Pool<T>) {
         if let Self::Pooled(held) = self {
             let prelude = held.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(prelude) = prelude {
-                pool.give(prelude, limit);
+                pool.give(prelude);
             }
         }
     }
@@ -161,9 +138,9 @@ mod tests {
         // Held until the list resets: a second submission records into the same pair.
         assert_eq!(first.record_with(&pool, make, |p| *p), Some(1));
         assert_eq!(second.record_with(&pool, make, |p| *p), Some(2));
-        first.recycle_capped(&pool, IDLE_LIMIT);
+        first.recycle(&pool);
         // Nothing held: a second reset gives nothing back twice.
-        first.recycle_capped(&pool, IDLE_LIMIT);
+        first.recycle(&pool);
         assert_eq!(pool.0.lock().unwrap().len(), 1);
         assert_eq!(pooled().record_with(&pool, make, |p| *p), Some(1));
         assert_eq!(first.record_with(&pool, make, |p| *p), Some(3));
@@ -175,7 +152,7 @@ mod tests {
         let pool = Pool::<u32>(Mutex::new(Vec::new()));
         let slot = Slot::Owned(OnceLock::new());
         assert_eq!(slot.record_with(&pool, || Some(7), |p| *p), Some(7));
-        slot.recycle_capped(&pool, IDLE_LIMIT);
+        slot.recycle(&pool);
         assert!(pool.0.lock().unwrap().is_empty());
         assert_eq!(slot.record_with(&pool, || Some(8), |p| *p), Some(7));
     }
@@ -187,18 +164,16 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_pool_is_capped_and_trimmed() {
+    fn the_idle_pool_keeps_a_fixed_number_of_pairs() {
         let pool = Pool::<u32>(Mutex::new(Vec::new()));
         for i in 0..IDLE_LIMIT as u32 + 5 {
-            pool.give(i, IDLE_LIMIT);
+            pool.give(i);
         }
         assert_eq!(pool.0.lock().unwrap().len(), IDLE_LIMIT);
-        // Under pressure a full pool takes no more.
-        pool.give(999, PRESSURED_LIMIT);
-        assert_eq!(pool.0.lock().unwrap().len(), IDLE_LIMIT);
-        pool.trim_to(PRESSURED_LIMIT);
-        assert_eq!(pool.0.lock().unwrap().len(), PRESSURED_LIMIT);
-        pool.trim_to(PRESSURED_LIMIT);
-        assert_eq!(pool.0.lock().unwrap().len(), PRESSURED_LIMIT);
+        // What was kept is handed out again without making a pair.
+        for _ in 0..IDLE_LIMIT {
+            assert!(pool.take(|| None).is_some());
+        }
+        assert_eq!(pool.take(|| None), None);
     }
 }
