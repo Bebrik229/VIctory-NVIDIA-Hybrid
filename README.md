@@ -111,6 +111,7 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
 - **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
 - **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + CPU/relay optimization wave (`#12`, `#13`, `#21`, `#28`, `#32`, `#35`, `#37`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, allocation-free write-watch shard walk (`#35`), uncovered-only title memory zeroing (`#28`), readback scratch/range merge reuse (`#32`) + pooled readback buffers (`VICTORY_READBACK_POOL=1`, `#12`), early relay command list recycling (`VICTORY_RECYCLE_LANDED_EARLY=1`, `#21`), batched CBV fill planning (`#37`), single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
+- **Indoor haze & froxel clamp (`#31`):** `VICTORY_AMBIENT_MARCH=1` clamps ray-marched in-scatter (`4,096`-view ring) to room luminance alongside constant-mode air clamp and NaN/Inf froxel scrubbing (`run-nvidia-fast.ps1` sets `VICTORY_AMBIENT=0.6`, `VICTORY_AMBIENT_AIR=1.0`, `VICTORY_AMBIENT_MARCH=1`; dark interiors can also try `VICTORY_AMBIENT=constant:0.35`).
 
 ---
 
@@ -139,14 +140,14 @@ cargo build --release -j 1 -p victory
 powershell -ExecutionPolicy Bypass -File .\scripts\get-agility-sdk.ps1
 ```
 
-### 2. Launch (Recommended RTX 12 GB Fast Preset)
+### 3. Launch (Recommended RTX 12 GB Fast Preset)
 
 ```powershell
 # Default: -Console series-s -Output 1920x1080 -Scale 0.5
 .\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe"
 
-# Enable NVIDIA Smooth Motion 2x copy (victory_sm.exe)
-.\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe" -SmoothMotion
+# Enable NVIDIA Smooth Motion 2x copy (victory_sm.exe) and optional hair shaders (-Hair)
+.\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe" -SmoothMotion -Hair
 
 # Higher quality (RELAY=1, CARD_STEPS=0) or 2K scaled (requires -Console series-x)
 .\scripts\run-nvidia-fast.ps1 -Quality -Console series-x -Output 2560x1440 -Scale 0.67
@@ -155,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\get-agility-sdk.ps1
 .\scripts\run-nvidia-fast.ps1 -DryRun
 ```
 
-> All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR` and `VICTORY_CACHE_DIR` environment variables or `victory.toml` are also supported.
+> All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-Hair`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` environment variables or `victory.toml` are also supported (`-Hair` sets `VICTORY_HAIR=1`, off by default for best GPU speed and clean geometry).
 
 ### 3. Pre-warm Shaders (Optional)
 

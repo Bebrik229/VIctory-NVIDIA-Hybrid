@@ -15,6 +15,7 @@ param(
     [string]$Output = '1920x1080',
     [double]$Scale = 0.5,
     [switch]$Quality,
+    [switch]$Hair,
     [switch]$SmoothMotion,
     [switch]$DryRun
 )
@@ -131,6 +132,9 @@ $env:VICTORY_LOG = 'info'
 $env:XCL_NETWORK = '0'
 $env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
 $env:VICTORY_CACHE_DIR = $CacheDir
+if (-not $env:VICTORY_DATA_DIR -and (Test-Path 'D:\victory-data\data')) {
+    $env:VICTORY_DATA_DIR = 'D:\victory-data\data'
+}
 
 $env:VICTORY_OUTPUT = $Output
 $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
@@ -146,9 +150,13 @@ $env:VICTORY_HEAP_BANKS = '3'
 $env:VICTORY_BVH_MISS = '1'
 $env:VICTORY_NAN_SCRUB = '1'
 
-$env:VICTORY_AMBIENT = '0.8'
-$env:VICTORY_AMBIENT_AIR = '1.5'
+$env:VICTORY_AMBIENT = if ($env:VICTORY_AMBIENT) { $env:VICTORY_AMBIENT } else { '0.6' }
+$env:VICTORY_AMBIENT_AIR = if ($env:VICTORY_AMBIENT_AIR) { $env:VICTORY_AMBIENT_AIR } else { '1.0' }
 $env:VICTORY_AMBIENT_MOST = '2'
+$env:VICTORY_AMBIENT_MARCH = if ($env:VICTORY_AMBIENT_MARCH) { $env:VICTORY_AMBIENT_MARCH } else { '1' }
+if ($Hair) {
+    $env:VICTORY_HAIR = '1'
+}
 
 $env:VICTORY_SKIP_PIPELINES = ($hashes -join ',')
 $env:VICTORY_PIPELINE_WAIT_MS = '25'
