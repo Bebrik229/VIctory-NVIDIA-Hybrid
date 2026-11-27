@@ -117,6 +117,12 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 cargo build --release -j 1 -p victory
 ```
 
+`victory.exe` loads the DirectX Agility SDK 1.619 runtime from `d3d12sdk\` beside it. Fetch it from NuGet after the build (the DLLs are never committed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\get-agility-sdk.ps1
+```
+
 ### 2. Launch (Recommended RTX 12 GB Fast Preset)
 
 ```powershell
