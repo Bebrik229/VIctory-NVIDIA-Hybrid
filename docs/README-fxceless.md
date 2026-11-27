@@ -251,6 +251,15 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_MONITOR` to put the title's own top-level window on another
+monitor: the device name (`DISPLAY3`) or the monitor's 1-based number in
+Windows' enumeration order (the order `EnumDisplayMonitors` lists them, not
+the numbers in Windows' display settings). The window is centred on that
+monitor's work area; a size left to Windows becomes three quarters of it,
+then `VICTORY_WINDOW_MAX` applies. Tool, child and owned windows stay where
+Windows puts them. With the variable unset, or naming no monitor, the
+primary monitor is used as before.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
