@@ -3674,6 +3674,7 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    let mut texture_scratch = crate::texback::Scratch::default();
     loop {
         let next = {
             let mut line = line();
@@ -3713,7 +3714,7 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => host.relay_land(items, &mut fetch, &mut texture_scratch),
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
@@ -4107,11 +4108,11 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
-fn read_backs(list: &HostList) {
+fn read_backs(list: &HostList, scratch: &mut crate::texback::Scratch) {
     // Textures shaders wrote that the title reads on the CPU
     // ([`crate::texback`]).
     for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
+        crate::texback::land(back, scratch);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
@@ -5085,15 +5086,16 @@ impl Host {
                     }
                 }
                 let mut notes = land::Notes::default();
+                let mut merged = 0;
                 for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                    let addressed = run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize));
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run, and the next waits
                     // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    merged += unsafe { run[0].0.land_card(addressed, after, &mut notes) };
                 }
                 notes.flush();
+                put.fetch_add(merged, Ordering::Relaxed);
                 land::spent(land::stat::CARD_ALL, working);
             });
             land::count(land::stat::JOBS, jobs.len() as u64);
@@ -5136,7 +5138,7 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>, texture_scratch: &mut crate::texback::Scratch) {
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
@@ -5205,7 +5207,7 @@ impl Host {
                 Late::Run(mut flight) => {
                     last = flight.number;
                     for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
+                        read_backs(flight.lists[i].host(), texture_scratch);
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5589,6 +5591,7 @@ impl Host {
         let was_working = working(true);
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
+        let mut texture_scratch = crate::texback::Scratch::default();
         loop {
             let items = {
                 let mut line = line();
@@ -5686,7 +5689,7 @@ impl Host {
                     Late::Run(mut flight) => {
                         last = flight.number;
                         for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
+                            read_backs(flight.lists[i].host(), &mut texture_scratch);
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
@@ -6176,10 +6179,11 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let mut texture_scratch = crate::texback::Scratch::default();
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            read_backs(list, &mut texture_scratch);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -10820,7 +10824,7 @@ mod refresh_tests {
                         crate::land::each(parts.len(), &|i| {
                             let mut notes = crate::land::Notes::default();
                             // SAFETY: the bytes of `now`; each piece once.
-                            unsafe { c.shadow.land_card(parts[i], after, &mut notes) };
+                            unsafe { c.shadow.land_card(parts[i].iter().copied(), after, &mut notes) };
                             notes.flush();
                         });
                         for &(from, to) in &ranges {
@@ -11123,7 +11127,7 @@ mod refresh_tests {
                             pieces.iter().map(|p| (p * PAGE + 8, (p + 1) * PAGE - 8, now.as_ptr() as usize)).collect();
                         let mut notes = crate::land::Notes::default();
                         // SAFETY: the bytes of `now`; nothing else lands here.
-                        unsafe { lands.land_card(&pieces, 0, &mut notes) };
+                        unsafe { lands.land_card(pieces.iter().copied(), 0, &mut notes) };
                         notes.flush();
                     }
                     started.elapsed().as_secs_f64() * 1e3
