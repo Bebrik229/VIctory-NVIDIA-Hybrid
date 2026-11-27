@@ -17,6 +17,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Version = '1.619.6'
+$Expected = [ordered]@{
+    'D3D12Core.dll'      = '37fa14281a58cc834076971873006feb8a8d25cddc908d1a345bda1b149ffc7d'
+    'd3d12SDKLayers.dll' = '7ab48d56d1c18708ebcf16c7c9259b2d783e2b935b85add4a244573b9f03cab4'
+}
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 $Destinations = @()
@@ -54,6 +58,12 @@ try {
     $DebugSrc = Join-Path $BinSrc 'd3d12SDKLayers.dll'
     if (-not (Test-Path $CoreSrc)) {
         throw "Missing D3D12Core.dll inside unpacked NuGet package at $BinSrc"
+    }
+    foreach ($name in $Expected.Keys) {
+        $file = Join-Path $BinSrc $name
+        if ((Test-Path $file) -and (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower() -ne $Expected[$name]) {
+            throw "$name from NuGet $Version does not match its SHA-256 $($Expected[$name])"
+        }
     }
 
     foreach ($dest in $Destinations) {
