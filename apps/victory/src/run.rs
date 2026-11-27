@@ -230,7 +230,6 @@ pub fn run(
                                 hex_str(new)
                             );
                         }
-                        tracing::info!(ms, "title step: longest simulation step raised (VICTORY_MAX_STEP_MS)");
                     }
                     Err((index, why)) => {
                         eprintln!("VIctory: VICTORY_MAX_STEP_MS: +{:#x} {why:?}; the title's step is left as it is", patches[index].0);

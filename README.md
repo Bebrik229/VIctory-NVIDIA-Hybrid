@@ -135,6 +135,10 @@ cargo build --release -j 1 -p victory
 
 > All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR` and `VICTORY_CACHE_DIR` environment variables or `victory.toml` are also supported.
 
+> **Title patches (known Xbox Series master build only, byte-checked):**
+> - The upscaler picker (+0x7e93f0) and its per-frame copy (+0x5400190) are written as a pair, or not at all. `VICTORY_UPSCALER=<kind>` (6 the title's own, 7 FidelityFX; the fast preset sets 6) goes to both; without it, `--console series-s` makes both return 6. `VICTORY_TITLE_PATCHES=0` turns that automatic choice off, `=1` applies it on any console.
+> - `VICTORY_MAX_STEP_MS=<66.7-333>` (off by default) raises the title's longest simulation step from about 66.7 ms, which reduces slow motion below 15 fps.
+
 ### 3. Pre-warm Shaders (Optional)
 
 ```powershell
