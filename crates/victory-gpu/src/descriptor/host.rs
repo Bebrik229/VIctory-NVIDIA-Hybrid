@@ -179,9 +179,9 @@ impl RemapTable {
         let base = crate::frame::current();
         #[cfg(test)]
         {
-            return base.saturating_add(
+            base.saturating_add(
                 self.test_frame_offset.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            )
         }
         #[cfg(not(test))]
         base
@@ -1357,16 +1357,25 @@ pub(crate) fn describe_slots(words: &[u32]) -> Vec<(usize, u32, String)> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn shown_bytes(at: u32, n: u32) -> Option<(u32, Vec<u8>, u32)> {
     super::with_view_heap(|host| {
-        let own = host.count + host.dynamic;
-        let end = if host.raw == 0 { own } else { host.raw + own };
-        let at = if at >= own && at < host.raw { host.raw } else { at };
-        let stop = if at < own { own } else { end };
+        let (own, end) = if let Some(remap) = &host.remap {
+            let end = remap.dyn_virt_base + remap.dyn_per_bank * host.banks.len() as u32;
+            (end, end)
+        } else {
+            let own = host.count + host.dynamic;
+            (own, if host.raw == 0 { own } else { host.raw + own })
+        };
+        let at = if host.remap.is_none() && at >= own && at < host.raw { host.raw } else { at };
+        let stop = if host.remap.is_none() && at < own { own } else { end };
         let n = n.min(stop.saturating_sub(at));
         if n == 0 || host.step != 32 {
             return None;
         }
         let mut bytes = vec![0u8; n as usize * 32];
-        crate::host::read_into(host.cpu(at).ptr as *const u8, &mut bytes).then_some((at, bytes, end))
+        for i in 0..n {
+            let first = i as usize * 32;
+            crate::host::read_into(host.cpu(at + i).ptr as *const u8, &mut bytes[first..first + 32]);
+        }
+        Some((at, bytes, end))
     })?
 }
 
@@ -1380,8 +1389,14 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
-            format!("dynamic slot {} (taken {taken:?})", index - host.count)
+            let rel = index.saturating_sub(host.dyn_virt_base());
+            let per_bank = host.dyn_per_bank().max(1);
+            let (bank, local) = ((rel / per_bank) as usize, rel % per_bank);
+            let taken = host
+                .banks
+                .get(bank)
+                .and_then(|b| b.next.lock().unwrap_or_else(|e| e.into_inner()).1.get(local as usize).copied());
+            format!("dynamic slot {} (taken {taken:?})", rel)
         };
         if twin {
             let made = host.twins.get(index as usize).map(|t| t.load(Relaxed));
@@ -3699,16 +3714,17 @@ impl HostHeap {
     }
 
     /// The shader-visible handle of slot `index` (primary bank).
+    #[allow(dead_code)]
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         self.gpu_handle_in(0, index)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "diagnostics"))]
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let (b, phys) = match self.resolve_for_read(index) {
             Some(SlotTarget::Title { phys }) => (0, phys),
             Some(SlotTarget::Dyn { bank, phys, .. }) => (bank, phys),
-            None => (0, index),
+            None => (0, self.remap.as_ref().map_or(index, |r| r.null_slot)),
         };
         self.banks[b].cpu(phys, self.step)
     }
