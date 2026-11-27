@@ -2762,7 +2762,8 @@ impl HostHeap {
                     continue;
                 }
             }
-            if let Some(kept) = make(&view, self.at(f.index)) {
+            let (kept, deferred) = crate::residency::upload_deferred_during(|| make(&view, self.at(f.index)));
+            if let Some(kept) = kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -2792,6 +2793,10 @@ impl HostHeap {
                 } else {
                     flipped += 1;
                 }
+            } else if deferred {
+                // The backing can be evicted while a flip is waiting. Let
+                // the texture pass upload the new backing before showing it.
+                self.queue_texture(f.index, true, false, crate::frame::current());
             }
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
@@ -4054,12 +4059,14 @@ impl HostHeap {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
-                None
+            let (kept, deferred) = if later {
+                (None, false)
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
+                crate::residency::upload_deferred_during(|| make_twinned(&view, self.at(index), self.twin(index)))
             };
+            // A null descriptor during an allocation cooldown is still due.
+            let ready_key = if later || (deferred && kept.is_none()) { 0 } else { key };
+            self.made.set(index, ready_key);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -4068,7 +4075,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, ready_key);
             drop(held);
             self.unmake_stale(index, stale);
         }
