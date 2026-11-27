@@ -908,6 +908,36 @@ mod card_tests {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
     }
+
+    /// A piece looks only at the joined ranges from the first that ends
+    /// past its start, and finds the parts the full search finds.
+    #[test]
+    fn a_piece_finds_its_parts_from_the_first_range_that_reaches_it() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for _ in 0..2000 {
+            let ranges: Vec<(usize, usize)> = (0..next(12))
+                .map(|_| {
+                    let from = next(200);
+                    (from, from + next(24))
+                })
+                .collect();
+            let skip = joined(ranges.clone());
+            let lo = next(200);
+            let hi = lo + 1 + next(40);
+            let near = &skip[skip.partition_point(|&(_, end)| end <= lo)..];
+            let mut parts = Vec::new();
+            super::for_outside(lo, hi, near.iter().copied(), |a, b| parts.push((a, b)));
+            let all = ranges.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+            assert_eq!(parts, super::outside(lo, hi, all), "{ranges:?} around {lo}..{hi}");
+            assert_eq!(near.first().is_none_or(|&(start, _)| start >= hi), parts == [(lo, hi)]);
+        }
+    }
 }
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
