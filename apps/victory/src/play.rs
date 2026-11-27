@@ -27,7 +27,6 @@ const SETTINGS: &[(&str, &str)] = &[
     ("XCL_NETWORK", "0"),
     ("VICTORY_D3D12_ADAPTER", "NVIDIA"),
     ("VICTORY_FRAME_INTERVAL_MS", "16.667"),
-    ("VICTORY_PANEL", "1"),
     // The title's own upscaler, at the scale asked for
     ("VICTORY_UPSCALER", "6"),
     // The view heap of an NVIDIA card: slots remapped, three banks
@@ -76,8 +75,10 @@ const SETTINGS: &[(&str, &str)] = &[
 ];
 
 /// Settings a start keeps when its surroundings already have them.
-const UNLESS_SET: &[(&str, &str)] =
-    &[("VICTORY_MOUSE_LOOK", "1"), ("VICTORY_MOUSE_SENS", "1.0"), ("VICTORY_MOUSE_INVERT_Y", "0")];
+const UNLESS_SET: &[(&str, &str)] = &[
+    ("VICTORY_PANEL", "0"),
+    ("VICTORY_MOUSE_LOOK", "1"), ("VICTORY_MOUSE_SENS", "1.0"), ("VICTORY_MOUSE_INVERT_Y", "0"),
+];
 
 const CONSOLES: [&str; 2] = ["series-s", "series-x"];
 const OUTPUTS: [&str; 2] = ["1920x1080", "2560x1440"];

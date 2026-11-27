@@ -15,6 +15,8 @@ pub static D3D12SDKVersion: u32 = 619;
 #[used]
 pub static D3D12SDKPath: &[u8; 12] = b".\\d3d12sdk\\\0";
 
+#[cfg(any(windows, test))]
+mod agility;
 mod census;
 mod inspect;
 #[cfg(windows)]
@@ -44,6 +46,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
@@ -209,6 +212,7 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     if let Command::Play(options) = &cli.command {
         let done = play::prepare(options).and_then(|ready| {
+            agility::warn_if_runtime_missing();
             victory_hle::runtime::set_title_args(options.title_args.clone());
             victory_core::logging::init("info");
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
@@ -263,7 +267,10 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, these } => {
+            agility::warn_if_runtime_missing();
+            warm::run(jobs, limit, again, used, these)
+        }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         Command::Run {
@@ -274,11 +281,16 @@ fn main() -> Result<()> {
             console,
             title_args,
         } => {
+            #[cfg(windows)]
+            agility::warn_if_runtime_missing();
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => {
+            agility::warn_if_runtime_missing();
+            replay::run(options)
+        }
         Command::Config => show_config(),
     }
 }
