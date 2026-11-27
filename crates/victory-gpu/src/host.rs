@@ -1257,6 +1257,14 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
+/// Objects kept through the retirement lag after a completed command list is reused.
+pub(crate) struct LandedObjects {
+    _deferred: Deferred,
+    _states: States,
+    _twins: std::collections::HashMap<usize, TwinUse>,
+    _coming: Option<(usize, std::sync::Arc<aside::Coming>)>,
+}
+
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
 /// in submission order, so a list cannot know which side an earlier list
@@ -3503,15 +3511,60 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle`), [`bury_lag`]
+/// flights after they landed. `VICTORY_RECYCLE_LANDED_EARLY=1` (off by
+/// default, experimental): the lists are reset and reused as soon as they
+/// land, and what their commands named waits out the lag on its own
+/// (`crate::list::recycle_landed`).
 fn land() {
+    static RECYCLE_EARLY: OnceLock<bool> = OnceLock::new();
+    let recycle_early =
+        *RECYCLE_EARLY.get_or_init(|| std::env::var_os("VICTORY_RECYCLE_LANDED_EARLY").is_some_and(|v| v == "1"));
     let landed: Vec<_> = {
         let mut line = line();
-        let n = line.landed.len().saturating_sub(bury_lag() as usize);
+        let n = landed_past_lag(line.landed.len(), if recycle_early { 0 } else { bury_lag() as usize });
         line.landed.drain(..n).collect()
     };
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        if recycle_early {
+            crate::list::recycle_landed(lists, &order);
+        } else {
+            crate::list::recycle(lists, &order);
+        }
+    }
+}
+
+/// How many of `landed` flights, oldest first, are past the newest `lag`.
+fn landed_past_lag(landed: usize, lag: usize) -> usize {
+    landed.saturating_sub(lag)
+}
+
+#[cfg(test)]
+mod landed_tests {
+    #[test]
+    fn flights_past_the_lag_are_recycled_and_all_of_them_without_one() {
+        assert_eq!(super::landed_past_lag(5, 3), 2);
+        assert_eq!(super::landed_past_lag(3, 64), 0);
+        assert_eq!(super::landed_past_lag(5, 0), 5);
+    }
+
+    #[test]
+    fn landed_objects_outlive_the_command_list_reset() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut list = host.new_list().expect("host list");
+        let (buffer, _) = host.upload_buffer(256).expect("upload buffer");
+        list.keep(&buffer);
+        list.close();
+        host.execute(&[&list]);
+
+        let held = list.take_landed_objects();
+        assert_eq!(held._deferred.kept.len(), 1);
+        assert!(list.deferred().kept.is_empty());
+        list.reset();
+        assert_eq!(held._deferred.kept.len(), 1);
+        assert!(list.deferred().kept.is_empty());
     }
 }
 
@@ -6625,6 +6678,17 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+    }
+
+    /// Moves the completed recording's resource references into the
+    /// retirement queue before the list and allocator are reset.
+    pub(crate) fn take_landed_objects(&mut self) -> LandedObjects {
+        LandedObjects {
+            _deferred: std::mem::take(self.deferred.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _states: std::mem::take(self.states.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _twins: std::mem::take(self.twins.get_mut().unwrap_or_else(|e| e.into_inner())),
+            _coming: self.coming.get_mut().unwrap_or_else(|e| e.into_inner()).take(),
+        }
     }
 
     /// Only after the list's last submission finished (every one is waited

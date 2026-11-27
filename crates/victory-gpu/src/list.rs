@@ -294,6 +294,30 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     }
 }
 
+/// [`recycle`] for lists that have only just landed
+/// (`VICTORY_RECYCLE_LANDED_EARLY=1`): the lists the card ran are reset and
+/// kept for [`fresh_list`] at once, and what their commands named (descriptor
+/// slots, upload memory, the objects the recording held) is retired on its
+/// own, as late as it would have gone with the list.
+#[cfg(windows)]
+pub(crate) fn recycle_landed(lists: Vec<Detached>, ran: &[usize]) {
+    let mut reused = Vec::new();
+    for (i, mut detached) in lists.into_iter().enumerate() {
+        if pools() && ran.contains(&i) {
+            crate::host::retire((
+                std::mem::take(&mut detached._state),
+                std::mem::take(&mut detached._uploads),
+                detached.host.take_landed_objects(),
+            ));
+            reused.push(detached);
+        } else {
+            crate::host::retire(detached);
+        }
+    }
+    let all: Vec<usize> = (0..reused.len()).collect();
+    recycle(reused, &all);
+}
+
 /// A wait for a memory value recorded into list `this`, with waits cut
 /// into lists (`crate::queue::cuts`). On the console the queue runs the
 /// list up to the wait, stands there until the value is in memory, and
