@@ -372,6 +372,19 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_is_told_where_its_recipes_are() {
+        let list = [worker_request(7, 0, "aa"), worker_request(2, 4096, "bb")].join(",");
+        assert_eq!(list, "7:0:aa,2:4096:bb");
+        let back = worker_requests(&list).unwrap();
+        let seen: Vec<_> = back.iter().map(|r| (r.index, r.offset, r.key)).collect();
+        assert_eq!(seen, [(7, 0, "aa"), (2, 4096, "bb")]);
+        // The form before offsets, or a torn one, is refused before any work.
+        for bad in ["7", "7:0", "7:x:aa", "x:0:aa", "7:0:aa,"] {
+            assert!(worker_requests(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn incomplete_or_out_of_order_results_leave_the_rest_retryable() {
         let chunk = [7, 3];
         assert!(Progress::default().finish(2, None).is_err());
@@ -394,18 +407,5 @@ mod tests {
             p.record(&chunk, &format!("made {n} 0.00 0")).unwrap();
         }
         assert_eq!(p.finish(2, None).unwrap(), (2, None));
-    }
-
-    #[test]
-    fn a_worker_is_told_where_its_recipes_are() {
-        let list = [worker_request(7, 0, "aa"), worker_request(2, 4096, "bb")].join(",");
-        assert_eq!(list, "7:0:aa,2:4096:bb");
-        let back = worker_requests(&list).unwrap();
-        let seen: Vec<_> = back.iter().map(|r| (r.index, r.offset, r.key)).collect();
-        assert_eq!(seen, [(7, 0, "aa"), (2, 4096, "bb")]);
-        // The form before offsets, or a torn one, is refused before any work.
-        for bad in ["7", "7:0", "7:x:aa", "x:0:aa", "7:0:aa,"] {
-            assert!(worker_requests(bad).is_err(), "{bad}");
-        }
     }
 }
