@@ -100,7 +100,7 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - `apps/victory` — CLI front end (`victory`)
 - `crates/victory-core`, `victory-pe`, `victory-loader`, `victory-hle`, `victory-gpu`, `victory-shader`, `victory-formats`, `victory-pipeline`, `victory-game` — core runtime, HLE, D3D12 backend, and GFX10-to-DXIL shader translator
 - `xtask` — repository policy verification (`cargo xtask policy`)
-- `scripts/get-agility-sdk.ps1` — fetches DirectX 12 Agility SDK `1.619.6` (`D3D12Core.dll`) into `target\release\d3d12sdk\`
+- `scripts/get-agility-sdk.ps1` — fetches DirectX 12 Agility SDK `1.619.6` (`D3D12Core.dll`) into `target\release\D3D12\`
 - `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix + auto-fetches Agility SDK if missing)
 - `scripts/rt_off_hashes.txt` — `1,034` RT-off shader pipeline hashes
 
@@ -132,7 +132,7 @@ cargo build --release -j 1 -p victory
 
 ### 2. Install DirectX 12 Agility SDK 1.619.6 (Required — prevents `0x887E0003`)
 
-`victory.exe` exports `D3D12SDKVersion = 619` and `D3D12SDKPath = ".\d3d12sdk\"` (`ID3D12Device13` / `OpenExistingHeapFromAddress1` for `VICTORY_PORT_CONSTANTS` / `VICTORY_INPLACE`). **Without `d3d12sdk\D3D12Core.dll` beside `victory.exe`, startup fails at DXR/root signature serialization with `D3D12_ERROR_INVALID_REDIST` (`0x887E0003`).**
+`victory.exe` exports `D3D12SDKVersion = 619` and `D3D12SDKPath = ".\D3D12\"` (`ID3D12Device13` / `OpenExistingHeapFromAddress1` for `VICTORY_PORT_CONSTANTS` / `VICTORY_INPLACE`). **Without `D3D12\D3D12Core.dll` beside `victory.exe`, startup fails at DXR/root signature serialization with `D3D12_ERROR_INVALID_REDIST` (`0x887E0003`).** On startup, `victory.exe` also checks legacy `d3d12sdk\D3D12Core.dll` and copies it into `D3D12\` automatically if `D3D12\D3D12Core.dll` is missing.
 
 `.\scripts\run-nvidia-fast.ps1` downloads it automatically on first run, or install it manually:
 

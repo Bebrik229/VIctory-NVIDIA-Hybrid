@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
     Downloads Microsoft DirectX 12 Agility SDK 1.619.6 (D3D12Core.dll, d3d12SDKLayers.dll)
-    into d3d12sdk\ beside victory.exe to match apps\victory\src\main.rs (D3D12SDKVersion = 619).
+    into D3D12\ beside victory.exe to match apps\victory\src\main.rs (D3D12SDKVersion = 619).
 .DESCRIPTION
-    victory.exe exports D3D12SDKVersion = 619 and D3D12SDKPath = ".\d3d12sdk\".
+    victory.exe exports D3D12SDKVersion = 619 and D3D12SDKPath = ".\D3D12\".
     Without D3D12Core.dll inside that folder, Direct3D 12 rejects startup with
     D3D12_ERROR_INVALID_REDIST (0x887E0003). This script fetches the official NuGet
     Microsoft.Direct3D.D3D12 1.619.6 package using a temporary folder inside the
@@ -26,7 +26,7 @@ if ($OutDir) {
     foreach ($b in $Build) {
         $binDir = Join-Path $RepoRoot "target\$b"
         if (Test-Path $binDir) {
-            $Destinations += (Join-Path $binDir 'd3d12sdk')
+            $Destinations += (Join-Path $binDir 'D3D12')
         }
     }
     if ($Destinations.Count -eq 0) {

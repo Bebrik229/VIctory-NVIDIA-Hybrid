@@ -48,15 +48,28 @@ if (-not (Test-Path $HashesFile)) {
 if (-not (Test-Path $ExePath)) {
     throw "Missing victory.exe at $ExePath. Build first with: cargo build --release -j 1 -p victory"
 }
-$AgilityDir = Join-Path (Split-Path $ExePath) 'd3d12sdk'
+$AgilityDir = Join-Path (Split-Path $ExePath) 'D3D12'
 $AgilityCore = Join-Path $AgilityDir 'D3D12Core.dll'
+if (-not (Test-Path $AgilityCore)) {
+    $LegacyAgilityDir = Join-Path (Split-Path $ExePath) 'd3d12sdk'
+    $LegacyAgilityCore = Join-Path $LegacyAgilityDir 'D3D12Core.dll'
+    if (Test-Path $LegacyAgilityCore) {
+        New-Item -ItemType Directory -Path $AgilityDir -Force | Out-Null
+        Copy-Item -Path $LegacyAgilityCore -Destination $AgilityCore -Force
+        $LegacyLayers = Join-Path $LegacyAgilityDir 'd3d12SDKLayers.dll'
+        if (Test-Path $LegacyLayers) {
+            Copy-Item -Path $LegacyLayers -Destination (Join-Path $AgilityDir 'd3d12SDKLayers.dll') -Force
+        }
+        Write-Host "[run-nvidia-fast] Copied Agility SDK from legacy d3d12sdk\ -> D3D12\" -ForegroundColor Yellow
+    }
+}
 if (-not (Test-Path $AgilityCore)) {
     $AgilityScript = Join-Path $LocalRepoRoot 'scripts\get-agility-sdk.ps1'
     if (-not (Test-Path $AgilityScript)) {
         $AgilityScript = Join-Path $RepoRoot 'scripts\get-agility-sdk.ps1'
     }
     if (Test-Path $AgilityScript) {
-        Write-Host "[run-nvidia-fast] Missing d3d12sdk\D3D12Core.dll (would fail with 0x887E0003). Auto-fetching Agility SDK 1.619.6..." -ForegroundColor Yellow
+        Write-Host "[run-nvidia-fast] Missing D3D12\D3D12Core.dll (would fail with 0x887E0003). Auto-fetching Agility SDK 1.619.6..." -ForegroundColor Yellow
         & $AgilityScript -OutDir $AgilityDir
     }
     if (-not (Test-Path $AgilityCore)) {
@@ -180,7 +193,7 @@ $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
 $env:VICTORY_CARD_BUFFERS_MB = '1536'
 $env:VICTORY_COMPOSE = '1'
 $env:VICTORY_WAIT_RESIDENT = '0'
-$env:VICTORY_PORT_CONSTANTS = '1'
+$env:VICTORY_PORT_CONSTANTS = if ($env:VICTORY_PORT_CONSTANTS) { $env:VICTORY_PORT_CONSTANTS } else { '1' }
 $env:VICTORY_PORT_CBV = '0' # NVIDIA 1M view-heap cap forces raw_twins=false; PORT_CBV=1 nulls non-256B CBVs -> B&W
 $env:VICTORY_PORT_GUARD = '1'
 $env:VICTORY_PORT_GUARD_PLAN = '1'
