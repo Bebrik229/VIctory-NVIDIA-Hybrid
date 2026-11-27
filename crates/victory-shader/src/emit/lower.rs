@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the pixel program declares early depth-stencil.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -117,9 +120,10 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    let early_depth = parts.native.stage == HwStage::Ps && super::early_depth_enabled();
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, early_depth).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1420,7 +1424,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, early_depth: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1431,6 +1435,19 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // DB_SHADER_CONTROL: bit 12 requests testing before a pixel shader
+        // runs. Skip shaders that write depth or stencil, whether the export
+        // is recorded in bits 0..2 or in the DXIL output signature.
+        const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+        const DEPTH_STENCIL_EXPORTS: u32 = 0b111;
+        if early_depth
+            && let StageIo::Ps { db_shader_control, .. } = x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            && db_shader_control & DEPTH_STENCIL_EXPORTS == 0
+            && !s.outputs.iter().any(|output| (17..=20).contains(&output.kind))
+        {
+            s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2484,6 +2501,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -12997,6 +13016,74 @@ mod tests {
 
     /// A minimum and then an add on one LDS word are not interchangeable
     /// between the two host halves. Two adds of the same word are.
+    #[test]
+    fn early_depth_requires_the_switch_and_a_compatible_pixel_program() {
+        let translate = |db_shader_control, enabled| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: [0x7E00_02F2, 0xF800_180F, 0, S_ENDPGM]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            };
+            let p = ir::build(&native.code, false, 1).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let parts = Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![super::SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 15,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            };
+            super::Lower::new(&parts, &std::collections::HashMap::new(), enabled)
+                .run(false)
+                .ok()
+                .expect("lower pixel shader")
+        };
+
+        const EARLY: u32 = 1 << 12;
+        let enabled = translate(EARLY, true);
+        assert!(enabled.early_depth);
+        assert!(!translate(EARLY, false).early_depth);
+        assert!(!translate(0, true).early_depth);
+        for export in [1, 2, 4] {
+            assert!(!translate(EARLY | export, true).early_depth);
+        }
+        #[cfg(windows)]
+        if let Ok(mut validator) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut enabled.dxil.clone()).unwrap();
+        }
+    }
+
     #[test]
     fn divergent_lds_atomics_need_instruction_order_between_halves() {
         let mut words: [u32; 15] = [
