@@ -2980,6 +2980,27 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// A pixel program's `s_cbranch_scc0` on the SCC of a mask operation that leaves EXEC
+    /// alone: the host's waves are not the console's there, so no wave answers for the branch
+    /// and each lane goes by its own bit, as before.
+    #[test]
+    fn a_pixel_branch_on_a_mask_scc_still_lowers() {
+        let shader = pixel(
+            &[
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0x8712_7E6A, // s_and_b32 s18, vcc_lo, exec_lo
+                0xBF84_0002, // s_cbranch_scc0 to the export
+                0x7E02_02FF, 0x3F80_0000, // v_mov_b32 v1, 1.0
+                0xF800_180F, 0x0101_0101, // exp mrt0 v1 v1 v1 v1 done vm
+                0xBF81_0000, // s_endpgm
+            ],
+            0,
+        )
+        .unwrap();
+        validate(&shader);
+    }
+
     /// The translation's `SFI0` features and `ISG1` rows.
     fn parts(shader: &HostShader) -> (u64, Vec<SigElement>) {
         let c = Container::parse(&shader.dxil).unwrap();

@@ -4290,10 +4290,11 @@ impl<'a> Lower<'a> {
 
     /// Whether the branch closing block `b` is one the console takes by the whole wave on the
     /// SCC of a mask operation ([`Structured::wave_scc`]) and is lowered so ([`Self::wave_wide`]).
-    /// Not with each host wave as a wave of its own ([`with_local_waves`]): there a half
+    /// Not with each host wave as a wave of its own ([`with_local_waves`]), nor where the
+    /// host's waves are not the console's (pixel, vertex and mesh programs): there a lane
     /// answers for itself, as before.
     fn is_wave_scc_branch(&self, b: usize) -> bool {
-        !self.local && self.x.st.wave_scc.contains(&b)
+        !self.local && self.mask_data == MaskData::Console && self.x.st.wave_scc.contains(&b)
     }
 
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
