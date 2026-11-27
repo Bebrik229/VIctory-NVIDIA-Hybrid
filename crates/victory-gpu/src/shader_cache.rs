@@ -77,6 +77,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_BVH_MISS",
             "VICTORY_NAN_SCRUB",
+            "VICTORY_LDS_FLAGS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
