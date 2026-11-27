@@ -135,6 +135,18 @@ cargo build --release -j 1 -p victory
 
 > All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR` and `VICTORY_CACHE_DIR` environment variables or `victory.toml` are also supported.
 
+### 2a. Launch Without the Script (`victory play`)
+
+`victory.exe` carries the same preset as `run-nvidia-fast.ps1`. Started with no command (a double click) or as `victory play`, it looks for `game_scarlett_master.exe` beside itself, then in the current folder, then in `VICTORY_GAME_DIR` / `victory.toml`:
+
+```powershell
+target\release\victory.exe play "D:\Games\GTA6\game_scarlett_master.exe"
+target\release\victory.exe play --quality --console series-x --output 2560x1440 --scale 0.67
+target\release\victory.exe play --set VICTORY_PANEL=0      # add or override any switch
+```
+
+Nothing is written beside the program or into the title's folder: the cache (`cache-nvidia`, unless `VICTORY_CACHE_DIR` is set) and a log for every start (`logs\play-<utc>-<pid>.log`, the newest ten kept) are under `%LOCALAPPDATA%\VIctory`. `VICTORY_LOG_FILE=<path>` adds such a plain-text log file to any command. `-SmoothMotion` and the `AboveNormal` priority remain the script's.
+
 ### 3. Pre-warm Shaders (Optional)
 
 ```powershell
