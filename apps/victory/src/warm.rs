@@ -26,7 +26,14 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(
+    jobs: Option<usize>,
+    limit: Option<usize>,
+    again: bool,
+    used: bool,
+    list_no_host: bool,
+    these: Option<String>,
+) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -82,6 +89,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     let mut rest = chunk;
                     while !rest.is_empty() {
                         let (made, ended) = child(rest, |n, ms, there| {
+                            if let Some(line) = no_host_line(list_no_host, there, &fingerprint, &keys[n]) {
+                                println!("{line}");
+                            }
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
                             }
@@ -125,6 +135,11 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.iter().sum::<f64>() / 1e3
     );
     Ok(())
+}
+
+// The same confirmed refusal on --again prints the same pair, even if its archive index changes.
+fn no_host_line(list: bool, made_host: bool, fingerprint: &str, key: &str) -> Option<String> {
+    (list && !made_host).then(|| format!("no-host {fingerprint} {key}"))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -207,4 +222,34 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_no_host_results_is_opt_in() {
+        use clap::Parser;
+        for (extra, expected) in [(None, false), (Some("--list-no-host"), true)] {
+            let args = ["victory", "warm"].into_iter().chain(extra);
+            let cli = crate::Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, crate::Command::Warm { list_no_host, .. } if list_no_host == expected));
+        }
+    }
+
+    #[test]
+    fn only_confirmed_no_host_results_are_listed_on_request() {
+        let outcomes = [("one", true), ("two", false), ("three", true)];
+        let lines = |list, fingerprint| {
+            outcomes
+                .iter()
+                .filter_map(|(key, host)| no_host_line(list, *host, fingerprint, key))
+                .collect::<Vec<_>>()
+        };
+        assert!(lines(false, "build-a").is_empty());
+        assert_eq!(lines(true, "build-a"), ["no-host build-a two"]);
+        assert_eq!(lines(true, "build-b"), ["no-host build-b two"]);
+        assert_eq!(no_host_line(true, false, "build-a", "two").as_deref(), Some("no-host build-a two"));
+    }
 }
