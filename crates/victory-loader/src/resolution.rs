@@ -35,10 +35,22 @@
 //!   in its padding (as pull request #53 did). That one is not safe: at 0.5
 //!   on Series S (run res-6) FidelityFX's jitter phase count came back 0 and
 //!   the title divided by it (+0x28f03e8) 49 s in.
+//! - **Interface size.** At a smaller output the title still lays its
+//!   interface out for 3840x2160. `VICTORY_UI_PLANE=1` (1920x1080, 1280x720;
+//!   `VICTORY_UI_PLANE_720=1` for 1280x720 only) makes it present the
+//!   interface as a second 3840x2160 plane, as it does on Series S, which
+//!   the host composes over the scene; `VICTORY_UI_VIEWBOX=1` instead fits
+//!   its dynamic viewboxes on the single plane. Both are off without it.
+//!   (Vice-Tay 9e2d88b, from avatarmanz/VIctory-7900XTX #295.)
 //! - **Upscaler.** `VICTORY_UPSCALER=<kind>` makes the picker return
 //!   `kind` (pull request #53): 6 the title's own, 7 FidelityFX.
 
 use crate::frame_rate::Patched;
+
+#[cfg(any(windows, test))]
+mod ui_plane;
+#[cfg(any(windows, test))]
+mod viewbox;
 
 /// Sizes the title has a display mode for (its own list, +0x615c0c0).
 pub const MODES: [(u32, u32); 5] = [(1280, 720), (1664, 936), (1920, 1080), (2560, 1440), (3840, 2160)];
@@ -299,9 +311,31 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
 pub unsafe fn apply_asked(base: usize, size: usize) {
     let mut asked: Vec<(&Site, Vec<u8>, String)> = Vec::new();
     if let Some((w, h)) = asked_output() {
-        asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
-        if (w, h) != (3840, 2160) {
-            asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+        let split_code = ui_plane::requested(
+            (w, h),
+            std::env::var_os("VICTORY_UI_PLANE").as_deref(),
+            std::env::var_os("VICTORY_UI_PLANE_720").as_deref(),
+        )
+        .then(|| ui_plane::output_code(w, h))
+        .flatten()
+        .filter(|_| unsafe {
+            [&OUTPUT, &POOL_CHECK, &ui_plane::POOL]
+                .iter()
+                .all(|site| matches(base, size, site) == Patched::Done)
+        });
+        if let Some(code) = split_code {
+            let value = format!("{w}x{h} scene, 3840x2160 interface");
+            asked.push((&POOL_CHECK, pool_check_code(), value.clone()));
+            asked.push((&ui_plane::POOL, ui_plane::SPLIT_POOL.to_vec(), value.clone()));
+            asked.push((&OUTPUT, code, value));
+        } else {
+            asked.push((&OUTPUT, output_code(w, h), format!("{w}x{h}")));
+            if (w, h) != (3840, 2160) {
+                asked.push((&POOL_CHECK, pool_check_code(), format!("{w}x{h}")));
+            }
+            if viewbox::requested((w, h), std::env::var_os("VICTORY_UI_VIEWBOX").as_deref()) {
+                asked.push((&viewbox::SITE, viewbox::FITTED.to_vec(), format!("{w}x{h}")));
+            }
         }
     }
     if let Some(s) = asked_render_scale() {
