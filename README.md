@@ -63,6 +63,8 @@ NVIDIA Direct3D 12 drivers enforce a hard `1,000,000` shader-visible CBV/SRV/UAV
   - Mouse-delta-to-right-stick smoothing (`VICTORY_MOUSE_LOOK=1`, `VICTORY_MOUSE_SENS=1.0`, `VICTORY_MOUSE_INVERT_Y=0`): **`F2` / Middle Mouse** locks/unlocks cursor, **`Esc` / Alt+Tab (focus loss)** unlocks, **`F7` / `F8`** adjusts sensitivity (`0.2`–`5.0`).
   - `RMB` = LT, `LMB` = RT, `X1` = B, `X2` = R3, plus 24-entry `FALLBACK_BUTTONS` keyboard mapping (`WASD` move, `Space`/`Left Shift` = A, `R`/`Backspace` = B, `X` = X, `G`/`Y` = Y, `Q`/`E` = LB/RB, `F`/`Left Ctrl` = LS, `H` = RS, `V`/`Tab` = View, `Esc` = Menu, `1`–`4` / Arrows = D-Pad).
 - **Anti-Stutter Tuning:** `VICTORY_PIPELINE_WAIT_MS=25`, `VICTORY_PIPELINE_WORKERS=4`, `VICTORY_PLACED_ORDER=1`.
+- **F3 stats panel in every build (`VICTORY_PANEL=1` shows it from the start):** frame rate and frame time, draws, how busy the GPU and the submitting thread are, copies, RAM and VRAM; the recording time is counted in `diagnostics` builds only.
+- **Water light switch (`VICTORY_WATER_LIGHT=1`):** the water's two tiled light programs (`CS_TransmissionVolumetrics_Tiled` `5dc3b25986622949`, `_Tiled_LocalLights` `6f225b641c5b0708`) are left out on 32-lane (NVIDIA) hosts, where their wave-wide form leaves whole tiles of open water dark and costs about 15 ms a frame (measured in `trustno1-coder/VIctory-NVIDIA` on an RTX 5070); `VICTORY_WATER_LIGHT=1` runs them where they translate.
 
 ### 5. Integrated Multi-Core Renderer Ports 1, 6, 7 & DirectStorage OOM Fix
 
@@ -84,7 +86,8 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 | `avatarmanz/VIctory-7900XTX` baseline | 1080p | `7.0 fps` (`143.2 ms`) | `preparing 19.7 ms`, `copy-back 10.1 ms` |
 | `vicky-cgbj` Ports 1, 6, 7 | 1080p, `Series S` | `10.5 fps` (`95.3 ms`) | `GPU 52.7 ms`, `Commit 16.90 GB` |
 | `vicky-cgbj` Ports 1, 5, 6, 7 | 1080p, `Series S` | `11.4 fps` median (`87.5 ms`, peak `13.1 fps`) | `GPU 47.2 ms` |
-| **`VIctory-NVIDIA-Hybrid` + Native Barriers** | **1080p `Scale=0.5`, `Series S`** | **`11.6–16.0 fps`** (median **`~14.5 fps`**, steady **`15.3–16.0 fps` / `62.5–65.5 ms`**) | `5.1k–5.7k draws/f`, `GPU wait 0.0–10.4 ms`, **`0` OOM, `0` descriptor cap** (`~29–32 fps` perceived with NVIDIA Smooth Motion 2x) |
+| **`VIctory-NVIDIA-Hybrid` + Native Barriers (pre-PR #1/`#26`)** | **1080p `Scale=0.5`, `Series S`** | **`11.6–16.0 fps`** (median **`~14.5 fps`**, steady **`15.3–16.0 fps` / `62.5–65.5 ms`**) | `5.1k–5.7k draws/f`, `GPU wait 0.0–10.4 ms`, **`0` OOM, `0` descriptor cap** (`~29–32 fps` perceived with NVIDIA Smooth Motion 2x) |
+| **`VIctory-NVIDIA-Hybrid` Latest (`#12`/`#21`/`#32`/`#35`/`#37`/`#44`/`#46`, Full Color)** | **1080p `Scale=0.5`, `Series S`** | **`9.3–16.1 fps`** (`62.0–107.1 ms/f`: `13.0–16.1 fps` open outdoor, `9.3–10.1 fps` `4.4k` draws dock/interior) | **CPU `preparing` cut to `18.0–20.5 ms`**, **`96–97%` GPU utilization**, `0` OOM, `0` descriptor cap |
 | **`VIctory-NVIDIA-Hybrid` 2K Full Color** | **`Series X`, `2560x1440`, `Scale=0.67`, `PORT_CBV=0`** | **`7.9 fps` median** (`7.6–8.5 fps`, `118–132 ms/f`) | `8,220 draws/f`, `22.89 GB WS`, `20.87 GB Commit`, **`0` OOM, `0` descriptor cap, full color verified** |
 | `VIctory-NVIDIA-Hybrid` Native 2K | `Series X`, `2560x1440`, `Scale=1.0` | `4.7–5.3 fps` (`190–211 ms/f`) | `12.4k–13.0k draws/f`, `9.99 GB` VRAM, `0` crashes |
 
@@ -97,8 +100,18 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - `apps/victory` — CLI front end (`victory`)
 - `crates/victory-core`, `victory-pe`, `victory-loader`, `victory-hle`, `victory-gpu`, `victory-shader`, `victory-formats`, `victory-pipeline`, `victory-game` — core runtime, HLE, D3D12 backend, and GFX10-to-DXIL shader translator
 - `xtask` — repository policy verification (`cargo xtask policy`)
-- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix enabled)
+- `scripts/get-agility-sdk.ps1` — fetches DirectX 12 Agility SDK `1.619.6` (`D3D12Core.dll`) into `target\release\d3d12sdk\`
+- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix + auto-fetches Agility SDK if missing)
 - `scripts/rt_off_hashes.txt` — `1,034` RT-off shader pipeline hashes
+
+---
+
+## Integrated NVIDIA & Performance Upgrades
+
+- **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
+- **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
+- **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + CPU/relay optimization wave (`#12`, `#13`, `#21`, `#28`, `#32`, `#35`, `#37`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, allocation-free write-watch shard walk (`#35`), uncovered-only title memory zeroing (`#28`), readback scratch/range merge reuse (`#32`) + pooled readback buffers (`VICTORY_READBACK_POOL=1`, `#12`), early relay command list recycling (`VICTORY_RECYCLE_LANDED_EARLY=1`, `#21`), batched CBV fill planning (`#37`), single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
+- **Indoor haze & froxel clamp (`#31`):** `VICTORY_AMBIENT_MARCH=1` clamps ray-marched in-scatter (`4,096`-view ring) to room luminance alongside constant-mode air clamp and NaN/Inf froxel scrubbing (`run-nvidia-fast.ps1` sets `VICTORY_AMBIENT=0.6`, `VICTORY_AMBIENT_AIR=1.0`, `VICTORY_AMBIENT_MARCH=1`; dark interiors can also try `VICTORY_AMBIENT=constant:0.35`).
 
 ---
 
@@ -117,14 +130,24 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 cargo build --release -j 1 -p victory
 ```
 
-### 2. Launch (Recommended RTX 12 GB Fast Preset)
+### 2. Install DirectX 12 Agility SDK 1.619.6 (Required — prevents `0x887E0003`)
+
+`victory.exe` exports `D3D12SDKVersion = 619` and `D3D12SDKPath = ".\d3d12sdk\"` (`ID3D12Device13` / `OpenExistingHeapFromAddress1` for `VICTORY_PORT_CONSTANTS` / `VICTORY_INPLACE`). **Without `d3d12sdk\D3D12Core.dll` beside `victory.exe`, startup fails at DXR/root signature serialization with `D3D12_ERROR_INVALID_REDIST` (`0x887E0003`).**
+
+`.\scripts\run-nvidia-fast.ps1` downloads it automatically on first run, or install it manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\get-agility-sdk.ps1
+```
+
+### 3. Launch (Recommended RTX 12 GB Fast Preset)
 
 ```powershell
 # Default: -Console series-s -Output 1920x1080 -Scale 0.5
 .\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe"
 
-# Enable NVIDIA Smooth Motion 2x copy (victory_sm.exe)
-.\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe" -SmoothMotion
+# Enable NVIDIA Smooth Motion 2x copy (victory_sm.exe) and optional hair shaders (-Hair)
+.\scripts\run-nvidia-fast.ps1 -TitleExe "D:\Games\GTA6\game_scarlett_master.exe" -SmoothMotion -Hair
 
 # Higher quality (RELAY=1, CARD_STEPS=0) or 2K scaled (requires -Console series-x)
 .\scripts\run-nvidia-fast.ps1 -Quality -Console series-x -Output 2560x1440 -Scale 0.67
@@ -133,7 +156,7 @@ cargo build --release -j 1 -p victory
 .\scripts\run-nvidia-fast.ps1 -DryRun
 ```
 
-> All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR` and `VICTORY_CACHE_DIR` environment variables or `victory.toml` are also supported.
+> All launcher parameters (`-RepoRoot`, `-TitleExe`, `-CacheDir`, `-Console`, `-Output`, `-Scale`, `-Quality`, `-Hair`, `-SmoothMotion`, `-DryRun`) are optional; `VICTORY_GAME_DIR`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` environment variables or `victory.toml` are also supported (`-Hair` sets `VICTORY_HAIR=1`, off by default for best GPU speed and clean geometry).
 
 ### 3. Pre-warm Shaders (Optional)
 

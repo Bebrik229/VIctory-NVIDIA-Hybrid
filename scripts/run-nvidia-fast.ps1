@@ -15,6 +15,7 @@ param(
     [string]$Output = '1920x1080',
     [double]$Scale = 0.5,
     [switch]$Quality,
+    [switch]$Hair,
     [switch]$SmoothMotion,
     [switch]$DryRun
 )
@@ -46,6 +47,21 @@ if (-not (Test-Path $HashesFile)) {
 
 if (-not (Test-Path $ExePath)) {
     throw "Missing victory.exe at $ExePath. Build first with: cargo build --release -j 1 -p victory"
+}
+$AgilityDir = Join-Path (Split-Path $ExePath) 'd3d12sdk'
+$AgilityCore = Join-Path $AgilityDir 'D3D12Core.dll'
+if (-not (Test-Path $AgilityCore)) {
+    $AgilityScript = Join-Path $LocalRepoRoot 'scripts\get-agility-sdk.ps1'
+    if (-not (Test-Path $AgilityScript)) {
+        $AgilityScript = Join-Path $RepoRoot 'scripts\get-agility-sdk.ps1'
+    }
+    if (Test-Path $AgilityScript) {
+        Write-Host "[run-nvidia-fast] Missing d3d12sdk\D3D12Core.dll (would fail with 0x887E0003). Auto-fetching Agility SDK 1.619.6..." -ForegroundColor Yellow
+        & $AgilityScript -OutDir $AgilityDir
+    }
+    if (-not (Test-Path $AgilityCore)) {
+        throw "Missing $AgilityCore (D3D12_ERROR_INVALID_REDIST 0x887E0003). Run .\scripts\get-agility-sdk.ps1 first."
+    }
 }
 if (-not (Test-Path $HashesFile)) {
     throw "Missing rt_off_hashes.txt at $HashesFile"
@@ -116,10 +132,13 @@ $env:VICTORY_LOG = 'info'
 $env:XCL_NETWORK = '0'
 $env:VICTORY_D3D12_ADAPTER = 'NVIDIA'
 $env:VICTORY_CACHE_DIR = $CacheDir
+if (-not $env:VICTORY_DATA_DIR -and (Test-Path 'D:\victory-data\data')) {
+    $env:VICTORY_DATA_DIR = 'D:\victory-data\data'
+}
 
 $env:VICTORY_OUTPUT = $Output
 $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
-$env:VICTORY_PANEL = '1'
+$env:VICTORY_PANEL = if ($env:VICTORY_PANEL) { $env:VICTORY_PANEL } else { '0' }
 $env:VICTORY_MOUSE_LOOK = if ($env:VICTORY_MOUSE_LOOK) { $env:VICTORY_MOUSE_LOOK } else { '1' }
 $env:VICTORY_MOUSE_SENS = if ($env:VICTORY_MOUSE_SENS) { $env:VICTORY_MOUSE_SENS } else { '1.0' }
 $env:VICTORY_MOUSE_INVERT_Y = if ($env:VICTORY_MOUSE_INVERT_Y) { $env:VICTORY_MOUSE_INVERT_Y } else { '0' }
@@ -131,9 +150,13 @@ $env:VICTORY_HEAP_BANKS = '3'
 $env:VICTORY_BVH_MISS = '1'
 $env:VICTORY_NAN_SCRUB = '1'
 
-$env:VICTORY_AMBIENT = '0.8'
-$env:VICTORY_AMBIENT_AIR = '1.5'
+$env:VICTORY_AMBIENT = if ($env:VICTORY_AMBIENT) { $env:VICTORY_AMBIENT } else { '0.6' }
+$env:VICTORY_AMBIENT_AIR = if ($env:VICTORY_AMBIENT_AIR) { $env:VICTORY_AMBIENT_AIR } else { '1.0' }
 $env:VICTORY_AMBIENT_MOST = '2'
+$env:VICTORY_AMBIENT_MARCH = if ($env:VICTORY_AMBIENT_MARCH) { $env:VICTORY_AMBIENT_MARCH } else { '1' }
+if ($Hair) {
+    $env:VICTORY_HAIR = '1'
+}
 
 $env:VICTORY_SKIP_PIPELINES = ($hashes -join ',')
 $env:VICTORY_PIPELINE_WAIT_MS = '25'
@@ -167,6 +190,8 @@ $env:VICTORY_SHOW_AFTER = '1'
 $env:VICTORY_THIN = '1'
 $env:VICTORY_JOIN_PARTS = '8'
 $env:VICTORY_UPLOAD_AHEAD = '1'
+$env:VICTORY_RECYCLE_LANDED_EARLY = '1'
+$env:VICTORY_READBACK_POOL = '1'
 
 if ($Quality) {
     $env:VICTORY_RELAY = '1'

@@ -29,6 +29,8 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>]` has the slow mean follow by the
+//! clock, not by the frame (see `settle`).
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -47,13 +49,28 @@
 //! (VIctory-Belobug-AMD 44dcd437). For uncounted indirect calls with one
 //! record, the hold checks its clamped dimensions on the GPU. Counted and
 //! multiple-record indirect calls are left alone.
+//!
+//! That bounds the title's volume of froxels. The veil itself comes another
+//! way: marched along rays (`scattering_transmittance_system`:
+//! `CS_Gather_Classified_*` write it at 180x102, the two
+//! `CS_ReconstructRaymarchClassified*` take it to 360x204), lit by the
+//! transparency probes, which without rays are the open sky indoors.
+//! `VICTORY_AMBIENT_MARCH=<multiple>` (with `VICTORY_AMBIENT` a number)
+//! holds that image to the multiple of the room's slow mean before either
+//! reconstruct reads it. Unset or 0: off. Measured in one interior on a
+//! 4 GB card: the image's mean 0.24 (high 0.31) in a clean run, 0.67 (high
+//! 0.94) in a veiled one, the room's mean near 0.29 (inferred, not read).
+//! So about 1 should leave the clean run as it is and cut the veiled one to
+//! under half: an estimate to begin measuring from, not a measured value.
 
+use std::sync::atomic::AtomicU32;
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
 use crate::host::{HostList, host, transition};
+use crate::object::This;
 
 /// Programs of the title the stand-in follows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +84,9 @@ pub(crate) enum Role {
     Air,
     /// Resolves the traced reflections.
     Reflect,
+    /// Rebuilds the in-scatter marched along rays from its gathered image:
+    /// followed before it runs, not after ([`clear_march`]).
+    March,
 }
 
 /// The program's part in this, by its name in the container.
@@ -86,6 +106,8 @@ fn role_in(container: &[u8], reflect_in: &[String]) -> Option<Role> {
         Some(Role::Air)
     } else if reflect_in.iter().any(|name| has(name.as_bytes())) {
         Some(Role::Reflect)
+    } else if has(b"CS_ReconstructRaymarchClassified") {
+        Some(Role::March)
     } else {
         None
     }
@@ -103,6 +125,10 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// that holds a 2D image of their format (the opaque surfaces' resolve has it
 /// at the first, the transparent ones' at the second; a buffer at the first).
 pub(crate) const REFLECTIONS: [(u8, u32); 2] = [(1, 128), (1, 136)];
+/// Where the reconstructs read the gathered in-scatter (R16G16B16A16_FLOAT,
+/// 180x102 on Series S; `Full` reads both, `NoAlpha` the first. The image
+/// of that format at 72 is velocity).
+pub(crate) const MARCH: [(u8, u32); 2] = [(1, 96), (1, 112)];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -200,14 +226,65 @@ fn parse_reflect_in(set: &str) -> Vec<String> {
         .collect()
 }
 
-/// LOCAL: how many times the estimate the title's own result may keep
-/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset).
+fn multiple(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+}
+
+/// The most the in-scatter marched along rays holds, as a multiple of the
+/// room's slow mean (`VICTORY_AMBIENT_MARCH=<multiple>`; unset or 0: what
+/// the title has. About 1 to begin with: see the module's text).
+pub(crate) fn march() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| multiple(&std::env::var("VICTORY_AMBIENT_MARCH").unwrap_or_default()))
+}
+
+/// How many times the estimate the title's own result may keep
+/// (`VICTORY_AMBIENT_MOST=<multiple>`, 4 when unset). Without rays the
+/// probes hold the sky's light indoors too; at 4 times the estimate a room
+/// looked towards a window or the sky goes very bright.
 fn most() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_MOST").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(4.0)
     })
+}
+
+/// How the slow mean of the light around follows the frames
+/// (`VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>]`, e.g.
+/// `250,3`; unset or 0: 0.04 of the way a frame, which is 25 frames: 0.8 s
+/// at 30 frames a second, 4-6 s at 4-6). Set, it is the same share of the
+/// way a second whatever the frame rate, and a change by more than the jump
+/// factor (3 when not given; 0: none) is taken at once, as a new room is.
+fn settle() -> Option<[f32; 2]> {
+    static SET: OnceLock<Option<[f32; 2]>> = OnceLock::new();
+    *SET.get_or_init(|| parse_settle(&std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_default()))
+}
+
+fn parse_settle(set: &str) -> Option<[f32; 2]> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
+    let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+    let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+    Some([ms, jump])
+}
+
+/// The share of the way the slow mean goes at a keeping that comes `ms`
+/// after the last.
+fn follow(ms: f32) -> f32 {
+    settle().map_or(0.04, |[constant, _]| 1.0 - (-ms / constant).exp())
+}
+
+/// Milliseconds since the last keeping ([`Role::Radiance`], once a frame);
+/// the first, and after a pause of over a second, as a frame of 30.
+fn frame_ms() -> f32 {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.swap(now, std::sync::atomic::Ordering::Relaxed);
+    match now.saturating_sub(last) {
+        0 => 1.0,
+        dt if last == 0 || dt > 1000 => 33.0,
+        dt => dt as f32,
+    }
 }
 
 /// Strength and radius of the creases' shade.
@@ -227,9 +304,9 @@ fn shade() -> [f32; 2] {
 
 const SOURCE: &str = r#"
 #ifdef HOLD_INDIRECT
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), SRV(t1)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), SRV(t1)"
 #else
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #endif
 #define CX 64
 #define CY 36
@@ -240,6 +317,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
+    float jump;
 #ifdef HOLD_INDIRECT
     uint indirect_at;
 #endif
@@ -284,7 +362,11 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
+    float share = (jump > 0.0 && max(a / b, b / a) > jump) ? 1.0 : follow;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, share) : now, 1.0);
 }
 #endif
 
@@ -342,14 +424,41 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint w, h, d;
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap;
+    if (constant > 0.0) {
+        cap = air * constant;
+    } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        uint at0 = (q.y * PX + q.x) * 3;
+        float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+        float far = float(at.z) / float(d);
+        cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    }
     float3 c = scattered[at];
+    // A NaN or infinity in the air is summed along every view ray through
+    // it: black or white patches floating in the room (tested as in `keep`).
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
+}
+#endif
+
+#ifdef MARCH
+RWTexture2D<float4> marched : register(u0);
+// No more than a multiple of the room's light as the last seconds showed
+// it (`air` is that multiple here); the hue and the fourth channel stay.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void clear_march(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    marched.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float4 c = marched[at.xy];
+    // (NaN or infinity: tested as in `keep`.)
+    if (any((asuint(c.rgb) & 0x7f800000u) == 0x7f800000u)) { marched[at.xy] = float4(0.0, 0.0, 0.0, c.a); return; }
+    float cap = air * dot(cells[CELLS].rgb, LUMA);
+    float has = dot(c.rgb, LUMA);
+    if (has > cap) marched[at.xy] = float4(c.rgb * (cap / has), c.a);
 }
 #endif
 
@@ -465,6 +574,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = any((asuint(found) & 0x7f800000u) == 0x7f800000u) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -481,6 +591,14 @@ const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
+/// Views of what the march clamp writes, a ring.
+/// shortcut: a view must last until its list has run, and nothing here
+/// waits for that: the ring is only long. The clamp takes up to 8 a frame,
+/// so 4,096 come round after about 500 frames, where 64 came round after 8;
+/// upgrade to slots retired by the list's fence if lists are ever held that
+/// long.
+const MARCH_VIEWS: u32 = 4096;
+
 struct Pass {
     root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
@@ -492,8 +610,15 @@ struct Pass {
     /// Made only while the hold of the reflections is on.
     hold: Option<ID3D12PipelineState>,
     hold_indirect: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
+    /// The marched in-scatter's clamp (`VICTORY_AMBIENT_MARCH`) and its
+    /// views: made only with the switch on, and apart: a failure here
+    /// leaves the stand-in itself standing.
+    march: Option<(ID3D12PipelineState, ID3D12DescriptorHeap)>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    /// Bytes between the views of `march`'s heap, and the next of them.
+    step: u32,
+    next: AtomicU32,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -545,6 +670,22 @@ fn make(
     } else {
         None
     };
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    let march = (march() > 0.0)
+        .then(|| -> windows::core::Result<_> {
+            let clamp = pipeline("MARCH", s!("clear_march"))?;
+            // SAFETY: plain heap creation.
+            let views: ID3D12DescriptorHeap = unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: MARCH_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?
+            };
+            Ok((clamp, views))
+        })
+        .and_then(|made| made.inspect_err(|e| tracing::warn!(error = %e, "no clamp of the marched in-scatter")).ok());
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -556,8 +697,12 @@ fn make(
         air,
         hold,
         hold_indirect: indirect_root.zip(hold_indirect),
+        march,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
+        // SAFETY: a plain query.
+        step: unsafe { device.GetDescriptorHandleIncrementSize(kind) },
+        next: AtomicU32::new(0),
     })
 }
 
@@ -696,7 +841,7 @@ impl IndirectHold<'_> {
         // INDIRECT_ARGUMENT. Restore that state for reuse and list teardown.
         unsafe {
             list.ResourceBarrier(&[transition(self.buffer, arguments, readable)]);
-            list.SetComputeRoot32BitConstant(0, self.at, 12);
+            list.SetComputeRoot32BitConstant(0, self.at, 13);
             list.SetComputeRootShaderResourceView(5, self.buffer.GetGPUVirtualAddress());
             list.SetPipelineState(pso);
             list.Dispatch(groups[0], groups[1], 1);
@@ -727,7 +872,7 @@ pub(crate) fn after(
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::March || role == Role::Air && air() == 0.0 {
         return false;
     }
     if role == Role::Reflect {
@@ -754,13 +899,17 @@ pub(crate) fn after(
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = 0.04f32.to_bits();
+    // (The mean alone reads these two; the clock is asked at a keeping only.)
+    if role == Role::Radiance {
+        words[8] = follow(frame_ms()).to_bits();
+        words[12] = settle().map_or(0.0, |[_, jump]| jump).to_bits();
+    }
     // The most the light the title left may hold, or a reflection.
     words[9] = match role {
         Role::Reflect => reflect(),
@@ -802,6 +951,8 @@ pub(crate) fn after(
                     run(hold, groups[0], groups[1], 1);
                 }
             }
+            // (Returned above: before its program, not after.)
+            Role::March => {}
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -815,13 +966,98 @@ pub(crate) fn after(
     true
 }
 
+/// Holds `image` (the gathered in-scatter a reconstruct is about to read:
+/// to unordered access, clamped, back) to [`march`] times the slow mean's
+/// luminance, hue kept. Sets the list's view heap and replaces its compute
+/// root signature and pipeline; false if it recorded nothing.
+pub(crate) fn clear_march(list: &HostList, image: This) -> bool {
+    use std::sync::atomic::Ordering;
+    let (Some(pass), Some(host)) = (pass(), host()) else {
+        return false;
+    };
+    let Some((clamp, views)) = &pass.march else {
+        return false;
+    };
+    // (The slow mean: none with the constant, none before a keeping.)
+    if !matches!(set(), Set::Estimate(_)) || !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(texture) = crate::resource::host_resource(image) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    // (R16G16B16A16_FLOAT.)
+    if d.Format.0 != 10
+        || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+    {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(format = d.Format.0, flags = d.Flags.0, width = d.Width, "marched in-scatter: an image that cannot be clamped");
+        });
+        return false;
+    }
+    let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: d.Format,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 } },
+    };
+    const WRITTEN: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+    const READ: u32 =
+        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
+    crate::list::ensure_state(list, image, WRITTEN);
+    list.keep(texture);
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % MARCH_VIEWS;
+    let mut words = [0u32; 11];
+    words[10] = march().to_bits();
+    let l = &list.list;
+    // (The title's gathers before it wrote the image through other views.)
+    uav_barrier(l);
+    // SAFETY: an open list; a slot of our heap; a live texture the list
+    // keeps, in the unordered-access state; buffers the list keeps.
+    unsafe {
+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: views.GetCPUDescriptorHandleForHeapStart().ptr + (slot * pass.step) as usize,
+        };
+        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: views.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(slot * pass.step),
+        };
+        host.device.CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&view), cpu);
+        l.SetDescriptorHeaps(&[Some(views.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 11, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(2, gpu);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetPipelineState(clamp);
+        l.Dispatch((d.Width as u32).div_ceil(8), d.Height.div_ceil(8), 1);
+    }
+    uav_barrier(l);
+    crate::list::ensure_state(list, image, READ);
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::capture::note_target(image);
+        list.note_op(|| format!("ambient March target={image:p}"));
+    }
+    static TOLD: Mutex<u32> = Mutex::new(0);
+    let mut said = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+    if *said < 4 {
+        *said += 1;
+        tracing::info!(width = d.Width, height = d.Height, most = march(), "the marched in-scatter is held to the light of the room");
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn settings() {
-        assert_eq!(parse(""), Set::Off);
+        assert_eq!(parse(""), Set::Estimate(1.0));
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
@@ -836,6 +1072,15 @@ mod tests {
         assert!(parse_reflect_in("").is_empty());
         assert!(parse_reflect_in(" , ,").is_empty());
         assert_eq!(parse_reflect_in("Ab, Cd ,"), ["Ab", "Cd"]);
+        assert_eq!(parse_settle(""), None);
+        assert_eq!(parse_settle("0"), None);
+        assert_eq!(parse_settle("250"), Some([250.0, 3.0]));
+        assert_eq!(parse_settle("250, 0"), Some([250.0, 0.0]));
+        assert_eq!(multiple(""), 0.0);
+        assert_eq!(multiple("0"), 0.0);
+        assert_eq!(multiple("-1"), 0.0);
+        assert_eq!(multiple("nan"), 0.0);
+        assert_eq!(multiple(" 1.5 "), 1.5);
     }
 
     #[test]
@@ -848,6 +1093,9 @@ mod tests {
         assert_eq!(role_in(b"..ResolveB..", &reflect), Some(Role::Reflect));
         assert_eq!(role_in(b"..ResolveA..", &[]), None);
         assert_eq!(role_in(b"..ResolveC..", &reflect), None);
+        assert_eq!(role(b"..CS_ReconstructRaymarchClassifiedFull_2d384eab_Wrapped.."), Some(Role::March));
+        assert_eq!(role(b"CS_ReconstructRaymarchClassifiedNoAlpha_2d384eab"), Some(Role::March));
+        assert_eq!(role(b"CS_ReconstructRaymarch_High_66f3d2a0"), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
@@ -858,6 +1106,8 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes), true).expect("the passes");
+        // (Made only with its switch on, so compiled here by itself.)
+        crate::host::compile(&format!("#define MARCH\n{SOURCE}"), s!("clear_march"), s!("cs_5_1")).expect("the march clamp");
     }
 
     /// The hold of the reflections compiles with the system's compiler too
@@ -893,7 +1143,7 @@ mod tests {
         let (oversized, oversized_bytes, _) = warp.shared_buffer(12);
         let (_budget, budget_bytes, budget) = warp.shared_buffer(256);
         let clamped = warp.default_uav(12);
-        let mut words = [0u32; 12];
+        let mut words = [0u32; 13];
         words[1] = 1.0f32.to_bits();
         words[9] = 0.25f32.to_bits();
         const BRIGHT: u32 = (31 << 27) | 511;
@@ -981,7 +1231,7 @@ mod tests {
                 )]);
                 list.SetDescriptorHeaps(&[Some(heap.clone())]);
                 list.SetComputeRootSignature(root);
-                list.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+                list.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
                 list.SetComputeRootDescriptorTable(2, heap.GetGPUDescriptorHandleForHeapStart());
                 list.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
                 list.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());

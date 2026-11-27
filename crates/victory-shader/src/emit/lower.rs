@@ -3637,6 +3637,60 @@ impl<'a> Lower<'a> {
         self.s.m.cast(self.cur, Cast::Bitcast, f, self.s.t.i32)
     }
 
+
+    /// Round `f` to the nearest integer, ties to even, in branchless integer
+    /// bit arithmetic. NVIDIA drivers constant-fold DXIL `Round_ne` of
+    /// half-way literals incorrectly and replace NaN payloads; doing the
+    /// rounding on IEEE-754 bits matches the RDNA 2 result on NVIDIA and WARP.
+    fn rndne_f32(&mut self, f: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let a = self.as_int(f);
+        let (sign_mask, mag_mask, qnan_bit, inf_bits) = (
+            k(self, 0x8000_0000),
+            k(self, 0x7FFF_FFFF),
+            k(self, 0x0040_0000),
+            k(self, 0x7F80_0000),
+        );
+        let (two23, half, one_f) = (k(self, 0x4B00_0000), k(self, 0x3F00_0000), k(self, 0x3F80_0000));
+        let (k0, k1, k23, k31, k150) = (k(self, 0), k(self, 1), k(self, 23), k(self, 31), k(self, 150));
+
+        let sign = self.s.m.bin(c, Bin::And, a, sign_mask);
+        let mag = self.s.m.bin(c, Bin::And, a, mag_mask);
+        let exp = self.s.m.bin(c, Bin::LShr, mag, k23);
+        let shift_raw = self.s.m.bin(c, Bin::Sub, k150, exp);
+        let shift = self.s.m.bin(c, Bin::And, shift_raw, k31);
+        let half_shift_raw = self.s.m.bin(c, Bin::Sub, shift, k1);
+        let half_shift = self.s.m.bin(c, Bin::And, half_shift_raw, k31);
+        let unit = self.s.m.bin(c, Bin::Shl, k1, shift);
+        let frac_mask = self.s.m.bin(c, Bin::Sub, unit, k1);
+        let half_bit = self.s.m.bin(c, Bin::Shl, k1, half_shift);
+        let rem = self.s.m.bin(c, Bin::And, mag, frac_mask);
+        let ones = k(self, u32::MAX);
+        let not_frac = self.s.m.bin(c, Bin::Xor, frac_mask, ones);
+        let trunc = self.s.m.bin(c, Bin::And, mag, not_frac);
+        let gt_half = self.s.m.cmp(c, pred::IUGT, rem, half_bit);
+        let eq_half = self.s.m.cmp(c, pred::EQ, rem, half_bit);
+        let lsb = self.s.m.bin(c, Bin::And, trunc, unit);
+        let odd = self.s.m.cmp(c, pred::NE, lsb, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, eq_half, odd);
+        let inc = self.s.m.bin(c, Bin::Or, gt_half, tie_up);
+        let add = self.s.m.select(c, inc, unit, k0);
+        let rounded_mag = self.s.m.bin(c, Bin::Add, trunc, add);
+        let mid = self.s.m.bin(c, Bin::Or, sign, rounded_mag);
+        let lt_one = self.s.m.cmp(c, pred::IULT, mag, one_f);
+        let le_half = self.s.m.cmp(c, pred::IULE, mag, half);
+        let signed_one = self.s.m.bin(c, Bin::Or, sign, one_f);
+        let small = self.s.m.select(c, le_half, sign, signed_one);
+        let r = self.s.m.select(c, lt_one, small, mid);
+        let ge_two23 = self.s.m.cmp(c, pred::IUGE, mag, two23);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, mag, inf_bits);
+        let quiet = self.s.m.bin(c, Bin::Or, a, qnan_bit);
+        let large = self.s.m.select(c, is_nan, quiet, a);
+        let bits = self.s.m.select(c, ge_two23, large, r);
+        self.as_float(bits)
+    }
+
     /// The SDWA operand selection of source `k`: a byte or word of the
     /// dword, zero- or sign-extended (none: the whole dword).
     fn sdwa_src(inst: &Inst, k: usize) -> Option<(u8, bool)> {
@@ -8518,6 +8572,7 @@ impl<'a> Lower<'a> {
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    26 => self.rndne_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
@@ -9553,6 +9608,7 @@ impl<'a> Lower<'a> {
                         12 | 13 => self.trig_turns(a, op == 12),
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                        26 => self.rndne_f32(a),
                         _ => self.unary(op, a),
                     }
                 }
@@ -10228,7 +10284,7 @@ impl<'a> Lower<'a> {
                 // byte src1[1:0] of src2.
                 let f = self.fsrc(inst, 0)?;
                 let (b, d) = (s(self, 1)?, s(self, 2)?);
-                let f = self.unary(26, f);
+                let f = self.rndne_f32(f);
                 let (zero, max) = (self.s.m.f32(0), self.s.m.f32(255.0f32.to_bits()));
                 let f = self.binary(35, f, zero);
                 let f = self.binary(36, f, max);
