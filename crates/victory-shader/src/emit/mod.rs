@@ -446,6 +446,38 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// The hash of the shader this thread translates ([`with_shader`]), named by the
+    /// `VICTORY_WAVE_WHY` lines: translations on several threads interleave them.
+    static SHADER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// A `VICTORY_WAVE_WHY` line, with the hash of this thread's shader in front when it has one.
+fn why_line(line: std::fmt::Arguments) -> String {
+    SHADER.with_borrow(|hash| if hash.is_empty() { line.to_string() } else { format!("[{hash}] {line}") })
+}
+
+/// `eprintln!` for the `VICTORY_WAVE_WHY` lines, with the shader's hash in front.
+macro_rules! wave_why {
+    ($($arg:tt)*) => {
+        eprintln!("{}", $crate::emit::why_line(format_args!($($arg)*)))
+    };
+}
+pub(crate) use wave_why;
+
+/// Runs the translation of the shader `hash` (16 hex digits) on this thread, its hash in
+/// front of the `VICTORY_WAVE_WHY` lines.
+pub fn with_shader<T>(hash: &str, translate: impl FnOnce() -> T) -> T {
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHADER.set(std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(SHADER.replace(hash.to_owned()));
+    translate()
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -476,8 +508,8 @@ pub fn emit(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
-                    Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
+                    Ok((_, wave)) => wave_why!("WAVE64-RETRY {what}: wave {wave:?}"),
+                    Err(e) => wave_why!("WAVE64-RETRY {what}: {e}"),
                 }
             }
         };
@@ -495,7 +527,7 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    wave_why!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
                 }
                 false
             }
@@ -505,7 +537,7 @@ pub fn emit(
         let form = |label: &str, p: Option<ir::Program>| {
             let Some(p) = p else {
                 if why {
-                    eprintln!("WAVE64-FORM {label}: ir returned None");
+                    wave_why!("WAVE64-FORM {label}: ir returned None");
                 }
                 return None;
             };
@@ -513,7 +545,7 @@ pub fn emit(
                 Ok(st) => st,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: structure failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: structure failed: {e}");
                     }
                     return None;
                 }
@@ -522,7 +554,7 @@ pub fn emit(
                 Ok(io) => io,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: io::raise failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: io::raise failed: {e}");
                     }
                     return None;
                 }
@@ -531,7 +563,7 @@ pub fn emit(
                 Ok(res) => res,
                 Err(e) => {
                     if why {
-                        eprintln!("WAVE64-FORM {label}: resource::track failed: {e}");
+                        wave_why!("WAVE64-FORM {label}: resource::track failed: {e}");
                     }
                     return None;
                 }
@@ -724,7 +756,7 @@ fn widen(
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
-                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+                wave_why!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
             }
             return Err(NOT);
         }
@@ -760,7 +792,7 @@ fn widen(
                         format!("B{b}({nm}{})", if back { ",BACK" } else { "" })
                     })
                     .collect();
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
+                wave_why!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
             }
             return r;
         }
@@ -771,7 +803,7 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                wave_why!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
         }
@@ -1070,6 +1102,23 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn a_translation_names_its_shader_and_the_name_is_restored_after() {
+        let named = || super::SHADER.with_borrow(Clone::clone);
+        let line = || super::why_line(format_args!("WAVE64-FORM {}: ir returned None", "plain"));
+        assert_eq!(line(), "WAVE64-FORM plain: ir returned None");
+        super::with_shader("0123456789abcdef", || {
+            assert_eq!(named(), "0123456789abcdef");
+            assert_eq!(line(), "[0123456789abcdef] WAVE64-FORM plain: ir returned None");
+            super::with_shader("fedcba9876543210", || assert_eq!(named(), "fedcba9876543210"));
+            assert_eq!(named(), "0123456789abcdef");
+            // (other threads' translations keep their own name)
+            assert_eq!(std::thread::spawn(named).join().unwrap(), "");
+        });
+        assert_eq!(named(), "");
+        assert_eq!(line(), "WAVE64-FORM plain: ir returned None");
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
