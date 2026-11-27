@@ -1075,6 +1075,45 @@ mod tests {
         assert_eq!(planned(&does), [(0, 0)]);
     }
 
+    /// A submission without buffer copies is planned by the short path: the
+    /// same answer as the full plan gives once a copy apart from everything
+    /// (not asked for, so never taken) is added behind the steps.
+    #[test]
+    fn fill_only_plans_match_the_full_plan() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for round in 0..4000 {
+            let mut does = Vec::new();
+            for _ in 0..1 + next(10) {
+                let (at, len) = (next(40) * 16, 16 + next(4) * 16);
+                does.push(match next(8) {
+                    0 => Does::Placed { dst: at, src: next(40) * 16 + 2000, len },
+                    1 => stuck(at, len),
+                    2 => Does::Read { from: at, to: at + len, asked: false },
+                    3 => Does::Refresh { shadow: 1, from: at, to: at + len },
+                    4 => fill(at, len, false),
+                    _ => fill(at, len, true),
+                });
+            }
+            let mut full = does.clone();
+            full.push(copy(1 << 30, 1 << 31, 16, false));
+            for (stage, by_order) in [(1, false), (1, true), (2, true)] {
+                let (mut a, mut b) = (None, None);
+                assert_eq!(
+                    plan(&does, stage, by_order, &mut a),
+                    plan(&full, stage, by_order, &mut b),
+                    "round {round}: {does:?}"
+                );
+                assert_eq!(a, b, "round {round}: {does:?}");
+            }
+        }
+    }
+
     #[test]
     fn indexed_writers_include_long_ranges_before_nested_writes() {
         let writers = [(30, 38), (80, 100), (0, 65), (10, 12), (50, 79), (8, 24), (31, 34)]
