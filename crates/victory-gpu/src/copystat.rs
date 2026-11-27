@@ -978,8 +978,8 @@ fn log_memory() {
             ("window without a length", window[6]),
             ("texture host copies", census[1]),
             ("texture title-fill copies", census[5]),
-            ("texture pool", (pool[0] as u64) << 20),
-            ("staging pool", (pool[1] as u64) << 20),
+            ("texture pool", pool[0] << 20),
+            ("staging pool", pool[1] << 20),
             ("live texture staging", staged[1]),
             ("descriptor views", views[2]),
             ("shader containers", kept[1]),
@@ -1277,7 +1277,7 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
-        crate::watch::lock_waits(frames as f64)
+        crate::watch::lock_waits(frames)
     );
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));

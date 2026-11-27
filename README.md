@@ -63,6 +63,8 @@ NVIDIA Direct3D 12 drivers enforce a hard `1,000,000` shader-visible CBV/SRV/UAV
   - Mouse-delta-to-right-stick smoothing (`VICTORY_MOUSE_LOOK=1`, `VICTORY_MOUSE_SENS=1.0`, `VICTORY_MOUSE_INVERT_Y=0`): **`F2` / Middle Mouse** locks/unlocks cursor, **`Esc` / Alt+Tab (focus loss)** unlocks, **`F7` / `F8`** adjusts sensitivity (`0.2`–`5.0`).
   - `RMB` = LT, `LMB` = RT, `X1` = B, `X2` = R3, plus 24-entry `FALLBACK_BUTTONS` keyboard mapping (`WASD` move, `Space`/`Left Shift` = A, `R`/`Backspace` = B, `X` = X, `G`/`Y` = Y, `Q`/`E` = LB/RB, `F`/`Left Ctrl` = LS, `H` = RS, `V`/`Tab` = View, `Esc` = Menu, `1`–`4` / Arrows = D-Pad).
 - **Anti-Stutter Tuning:** `VICTORY_PIPELINE_WAIT_MS=25`, `VICTORY_PIPELINE_WORKERS=4`, `VICTORY_PLACED_ORDER=1`.
+- **F3 stats panel in every build (`VICTORY_PANEL=1` shows it from the start):** frame rate and frame time, draws, how busy the GPU and the submitting thread are, copies, RAM and VRAM; the recording time is counted in `diagnostics` builds only.
+- **Water light switch (`VICTORY_WATER_LIGHT=1`):** the water's two tiled light programs (`CS_TransmissionVolumetrics_Tiled` `5dc3b25986622949`, `_Tiled_LocalLights` `6f225b641c5b0708`) are left out on 32-lane (NVIDIA) hosts, where their wave-wide form leaves whole tiles of open water dark and costs about 15 ms a frame (measured in `trustno1-coder/VIctory-NVIDIA` on an RTX 5070); `VICTORY_WATER_LIGHT=1` runs them where they translate.
 
 ### 5. Integrated Multi-Core Renderer Ports 1, 6, 7 & DirectStorage OOM Fix
 
@@ -97,8 +99,17 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - `apps/victory` — CLI front end (`victory`)
 - `crates/victory-core`, `victory-pe`, `victory-loader`, `victory-hle`, `victory-gpu`, `victory-shader`, `victory-formats`, `victory-pipeline`, `victory-game` — core runtime, HLE, D3D12 backend, and GFX10-to-DXIL shader translator
 - `xtask` — repository policy verification (`cargo xtask policy`)
-- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix enabled)
+- `scripts/get-agility-sdk.ps1` — fetches DirectX 12 Agility SDK `1.619.6` (`D3D12Core.dll`) into `target\release\d3d12sdk\`
+- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix + auto-fetches Agility SDK if missing)
 - `scripts/rt_off_hashes.txt` — `1,034` RT-off shader pipeline hashes
+
+---
+
+## Integrated NVIDIA & Performance Upgrades
+
+- **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
+- **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
+- **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + pipeline/warm-up wins (`#13`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
 
 ---
 
@@ -115,6 +126,16 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 
 ```powershell
 cargo build --release -j 1 -p victory
+```
+
+### 2. Install DirectX 12 Agility SDK 1.619.6 (Required — prevents `0x887E0003`)
+
+`victory.exe` exports `D3D12SDKVersion = 619` and `D3D12SDKPath = ".\d3d12sdk\"` (`ID3D12Device13` / `OpenExistingHeapFromAddress1` for `VICTORY_PORT_CONSTANTS` / `VICTORY_INPLACE`). **Without `d3d12sdk\D3D12Core.dll` beside `victory.exe`, startup fails at DXR/root signature serialization with `D3D12_ERROR_INVALID_REDIST` (`0x887E0003`).**
+
+`.\scripts\run-nvidia-fast.ps1` downloads it automatically on first run, or install it manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\get-agility-sdk.ps1
 ```
 
 ### 2. Launch (Recommended RTX 12 GB Fast Preset)
