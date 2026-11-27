@@ -104,10 +104,10 @@ fn role_in(container: &[u8], reflect_in: &[String]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
-    } else if reflect_in.iter().any(|name| has(name.as_bytes())) {
-        Some(Role::Reflect)
     } else if has(b"CS_ReconstructRaymarchClassified") {
         Some(Role::March)
+    } else if reflect_in.iter().any(|name| has(name.as_bytes())) {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -1093,6 +1093,9 @@ mod tests {
         assert_eq!(role_in(b"..ResolveB..", &reflect), Some(Role::Reflect));
         assert_eq!(role_in(b"..ResolveA..", &[]), None);
         assert_eq!(role_in(b"..ResolveC..", &reflect), None);
+        // No text takes a program of the other roles.
+        let wide = ["Raymarch".to_owned()];
+        assert_eq!(role_in(b"CS_ReconstructRaymarchClassifiedFull_2d384eab", &wide), Some(Role::March));
         assert_eq!(role(b"..CS_ReconstructRaymarchClassifiedFull_2d384eab_Wrapped.."), Some(Role::March));
         assert_eq!(role(b"CS_ReconstructRaymarchClassifiedNoAlpha_2d384eab"), Some(Role::March));
         assert_eq!(role(b"CS_ReconstructRaymarch_High_66f3d2a0"), None);
