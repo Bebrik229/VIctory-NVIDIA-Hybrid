@@ -157,7 +157,7 @@ if (-not $env:VICTORY_DATA_DIR -and (Test-Path 'D:\victory-data\data')) {
 }
 
 $env:VICTORY_OUTPUT = $Output
-$env:VICTORY_FRAME_INTERVAL_MS = '16.667'
+$env:VICTORY_FRAME_INTERVAL_MS = if ($env:VICTORY_FRAME_INTERVAL_MS) { $env:VICTORY_FRAME_INTERVAL_MS } else { '0' } # 0 = uncapped FPS (set 16.667 for 60 Hz, off for title 30 Hz)
 $env:VICTORY_PANEL = if ($env:VICTORY_PANEL) { $env:VICTORY_PANEL } else { '0' }
 $env:VICTORY_MOUSE_LOOK = if ($env:VICTORY_MOUSE_LOOK) { $env:VICTORY_MOUSE_LOOK } else { '1' }
 $env:VICTORY_MOUSE_SENS = if ($env:VICTORY_MOUSE_SENS) { $env:VICTORY_MOUSE_SENS } else { '1.0' }

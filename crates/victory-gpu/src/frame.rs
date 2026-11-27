@@ -17,7 +17,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -31,16 +31,43 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+static DEFAULT_UNCAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Uncaps the host frame clock (`Duration::ZERO`) when `VICTORY_FRAME_INTERVAL_MS` is unset.
+pub fn set_default_uncapped() {
+    DEFAULT_UNCAPPED.store(true, Ordering::Relaxed);
+}
+
+fn resolve_asked(spec: Option<&str>, default_uncapped: bool) -> Option<Duration> {
+    match spec {
+        None => default_uncapped.then_some(Duration::ZERO),
+        Some(s) if s.trim().eq_ignore_ascii_case("off") => None,
+        Some(s) => parse_ms(s),
+    }
+}
+
 /// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
-/// title's (zero: no wait). Read once.
+/// title's (zero: no wait; `off`: keep title's interval). Read once.
 fn asked() -> Option<Duration> {
     static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
     *ASKED.get_or_init(|| {
-        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
-        let ms = parse_ms(&spec);
-        match ms {
-            Some(d) => tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)"),
-            None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000; the title's interval kept"),
+        let default_uncapped = DEFAULT_UNCAPPED.load(Ordering::Relaxed);
+        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok();
+        let ms = resolve_asked(spec.as_deref(), default_uncapped);
+        match (&spec, ms) {
+            (Some(raw), None) if raw.trim().eq_ignore_ascii_case("off") => {
+                tracing::info!("VICTORY_FRAME_INTERVAL_MS=off; the title's interval kept");
+            }
+            (Some(raw), None) => {
+                tracing::warn!(spec = %raw, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000 or off; the title's interval kept");
+            }
+            (Some(_), Some(d)) => {
+                tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)");
+            }
+            (None, Some(d)) => {
+                tracing::info!(interval = ?d, "frame interval of ours uncapped by default (set VICTORY_FRAME_INTERVAL_MS=off or <ms> to limit)");
+            }
+            (None, None) => {}
         }
         ms
     })
@@ -326,6 +353,11 @@ mod tests {
         assert_eq!(parse_ms("1001"), None);
         assert_eq!(parse_ms("NaN"), None);
         assert_eq!(parse_ms("fast"), None);
+        assert_eq!(resolve_asked(None, false), None);
+        assert_eq!(resolve_asked(None, true), Some(Duration::ZERO));
+        assert_eq!(resolve_asked(Some("off"), true), None);
+        assert_eq!(resolve_asked(Some(" OFF "), true), None);
+        assert_eq!(resolve_asked(Some("16.667"), true), Some(Duration::from_micros(16_667)));
     }
 
     #[test]

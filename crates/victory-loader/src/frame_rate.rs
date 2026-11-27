@@ -41,16 +41,37 @@
 //! compared before anything is written; a site whose bytes differ is left
 //! alone and said so (another build of the title).
 
-/// The switch: the interval in milliseconds our frame clock ticks at
-/// (`victory-gpu`'s `frame`), 0 for no wait at all. `None` if unset or
-/// malformed (said why).
-pub fn asked_interval_ms() -> Option<f64> {
-    let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
-    let ms = parse_interval_ms(&spec);
-    if ms.is_none() {
-        eprintln!("VIctory: VICTORY_FRAME_INTERVAL_MS={spec}: expected milliseconds from 0 (no wait) to 1000");
+/// Resolves `VICTORY_FRAME_INTERVAL_MS` (`None` -> `0.0` when `default_uncapped`, `"off"` -> `None`).
+pub fn resolve_interval_ms(spec: Option<&str>, default_uncapped: bool) -> Option<f64> {
+    match spec {
+        None => default_uncapped.then_some(0.0),
+        Some(s) if s.trim().eq_ignore_ascii_case("off") => None,
+        Some(s) => parse_interval_ms(s),
+    }
+}
+
+fn read_interval_ms(default_uncapped: bool) -> Option<f64> {
+    let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok();
+    let ms = resolve_interval_ms(spec.as_deref(), default_uncapped);
+    if let Some(raw) = &spec
+        && ms.is_none()
+        && !raw.trim().eq_ignore_ascii_case("off")
+    {
+        eprintln!("VIctory: VICTORY_FRAME_INTERVAL_MS={raw}: expected milliseconds from 0 (no wait) to 1000, or off");
     }
     ms
+}
+
+/// The switch: the interval in milliseconds our frame clock ticks at
+/// (`victory-gpu`'s `frame`), 0 for no wait at all. `None` if unset or
+/// `"off"` or malformed (said why).
+pub fn asked_interval_ms() -> Option<f64> {
+    read_interval_ms(false)
+}
+
+/// Same as [`asked_interval_ms`], defaulting to `0.0` (uncapped FPS) when unset.
+pub fn asked_interval_ms_or_uncapped() -> Option<f64> {
+    read_interval_ms(true)
 }
 
 /// `16.667` â†’ 16.667; 0 is allowed (no wait), more than a second is not.
@@ -235,6 +256,11 @@ mod tests {
         assert_eq!(parse_interval_ms("-1"), None);
         assert_eq!(parse_interval_ms("fast"), None);
         assert_eq!(parse_interval_ms("1001"), None);
+        assert_eq!(resolve_interval_ms(None, true), Some(0.0));
+        assert_eq!(resolve_interval_ms(None, false), None);
+        assert_eq!(resolve_interval_ms(Some("off"), true), None);
+        assert_eq!(resolve_interval_ms(Some(" OFF "), true), None);
+        assert_eq!(resolve_interval_ms(Some("16.667"), true), Some(16.667));
         assert_eq!(title_rate(16.667, None), Some(60));
         assert_eq!(title_rate(8.333, None), Some(120));
         assert_eq!(title_rate(33.333, None), Some(30));

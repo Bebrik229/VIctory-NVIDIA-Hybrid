@@ -78,6 +78,12 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Uncaps the host frame clock (`Duration::ZERO`) unless `VICTORY_FRAME_INTERVAL_MS` is set.
+pub fn set_default_uncapped_fps() {
+    #[cfg(windows)]
+    victory_gpu::frame::set_default_uncapped();
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",
