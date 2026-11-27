@@ -1,5 +1,6 @@
-//! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): white
+//! The run's numbers on the picture, in every build (`VICTORY_PANEL=1`; off
+//! by default; F3 shows and hides it while our window has the focus; the
+//! time spent recording is counted in diagnostics builds only): white
 //! text on a black box in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
 //! thread. Made again twice a second from the counters of
@@ -177,7 +178,10 @@ const COUNTERS: usize = 11;
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
+        #[cfg(feature = "diagnostics")]
+        let recording = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let recording = 0;
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         Counters([
             super::worked(),
@@ -189,7 +193,7 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            recording,
             crate::draw::drawn(),
         ])
     }
@@ -205,11 +209,34 @@ impl Counters {
     }
 }
 
+/// The process's memory in bytes: in physical memory, and committed
+/// (private bytes).
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
+/// The recording and copy-back line; recording is counted in diagnostics builds only.
+fn copies(recording_ns: f64, copy_back_us: f64) -> String {
+    if cfg!(feature = "diagnostics") {
+        format!("RECORDING {:.0} MS  COPY BACK {:.1}", recording_ns / 1e6, copy_back_us / 1e3)
+    } else {
+        format!("COPY BACK {:.1} MS", copy_back_us / 1e3)
+    }
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
+    let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
@@ -217,7 +244,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+        copies(c[9], c[5]),
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
@@ -363,6 +390,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -439,6 +467,18 @@ mod tests {
                 assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
             }
         }
+    }
+
+    /// The line names the recording time only where it is counted, and fits the box.
+    #[test]
+    fn the_copies_line_fits_every_build() {
+        let line = copies(12e6, 3400.0);
+        if cfg!(feature = "diagnostics") {
+            assert_eq!(line, "RECORDING 12 MS  COPY BACK 3.4");
+        } else {
+            assert_eq!(line, "COPY BACK 3.4 MS");
+        }
+        assert!(line.len() <= COLUMNS as usize);
     }
 
     #[test]
