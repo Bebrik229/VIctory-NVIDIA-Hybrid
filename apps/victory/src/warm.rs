@@ -93,7 +93,8 @@ pub fn run(
                     while !rest.is_empty() {
                         let (made, ended) = child(rest, |n, ms, there| {
                             if let Some(line) = no_host_line(list_no_host, there, &fingerprint, &keys[n]) {
-                                println!("{line}");
+                                // A reader that closed stdout must not stop the warm-up.
+                                let _ = writeln!(std::io::stdout(), "{line}");
                             }
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
