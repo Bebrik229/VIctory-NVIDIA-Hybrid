@@ -492,6 +492,26 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// Retires a batch of resources under one [`RETIRED`] lock.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    if objects.is_empty() {
+        return;
+    }
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    let count = objects.len() as u64;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(count, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(count, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(objects.into_iter().map(|object| (started, Retired::Resource(object))));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -6269,6 +6289,11 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
+        // (Coder W, `VICTORY_FILL_FROM_PLACED`) Fills that read a copy at its place read its source.
+        if late && place::fill_from_placed() != 0 {
+            let written = line().written.clone();
+            place::redirect_fills(runs, &written);
+        }
         let own = if late { self.card_steps(runs) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
@@ -6316,21 +6341,34 @@ impl Host {
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static RES_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let sweep_every = if upcheck::on() || crate::residency::pressured() { 1500 } else { 15_000 };
         if !behind {
             if upcheck::on() {
                 upcheck::at_rest(self);
             }
             sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            if upcheck::on() {
-                upcheck::at_rest(self);
+            SWEPT.store(now, Ordering::Relaxed);
+            RES_REFRESH.store(now, Ordering::Relaxed);
+        } else {
+            if now > RES_REFRESH.load(Ordering::Relaxed) + 1000 {
+                crate::residency::refresh();
+                RES_REFRESH.store(now, Ordering::Relaxed);
             }
-            sweep();
-            SWEPT.store(now_ms(), Ordering::Relaxed);
+            let sweep_every = if crate::residency::pressured() { 1500 } else { sweep_every };
+            if late_free_present() && now > SWEPT.load(Ordering::Relaxed) + sweep_every {
+                // With the present sent ahead nothing else brings a moment
+                // with nothing in the air: one is made for the sweep.
+                self.settle(&mut submitted, WHY_SYNC);
+                if upcheck::on() {
+                    upcheck::at_rest(self);
+                }
+                sweep();
+                let swept_at = now_ms();
+                SWEPT.store(swept_at, Ordering::Relaxed);
+                RES_REFRESH.store(swept_at, Ordering::Relaxed);
+            }
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
@@ -6357,24 +6395,30 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let ask_guards = crate::watch::ask_once_guards() != 0;
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut guarded: ByCopy<(usize, usize)> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                        if shadow.asked_ahead() {
+                            let span = spans.entry(ptr).or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        if ask_guards && shadow.is_guarded() {
+                            let span = guarded.entry(ptr).or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
                     }
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let guarded_ranges: Vec<(usize, usize)> = guarded.into_values().collect();
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            crate::watch::ask_once(&ranges);
+            crate::watch::ask_once_submission(&ranges, &guarded_ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -6419,6 +6463,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.fill();
+        if place::fill_from_placed() != 0 {
+            place::check_fills();
+        }
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
@@ -7191,6 +7238,11 @@ impl HostList {
     }
 
     /// See [`HostList::changed_something`].
+    /// How many deferred steps the list has queued.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
     }
@@ -8221,7 +8273,7 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
@@ -8261,7 +8313,7 @@ impl HostList {
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
                     batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written_at(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -8588,10 +8640,137 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// (`VICTORY_REFRESH_ONCE`) Copies (by address) brought up to date in this
+    /// submission by its flushes, and the range, until a step of ours writes
+    /// title memory there.
+    once: ByCopy<(usize, usize)>,
+    /// (Coder W, `VICTORY_NARROW_WRITES=verify`) Title bytes of refreshes the narrow path would
+    /// have left pending over a write of ours: (address, bytes before it), compared at the next
+    /// step of the batch.
+    narrow_checks: Vec<(usize, Vec<u8>)>,
     /// One-entry caches for [`Batch::add`] to avoid repeated hash lookups on
     /// consecutive refreshes of the same copy.
     last_ahead: (usize, usize, usize),
     last_index: (usize, usize),
+}
+
+/// (Coder W) `VICTORY_NARROW_WRITES`: 0 off, 1 on, 2 verify.
+///
+/// A write of ours into title memory (a title copy step, a copy at its place) flushed every
+/// pending refresh of the submission and dropped every copy brought up to date ahead
+/// ([`Batch::title_written_at`]), though only those over the written bytes, or over another
+/// address that shows the same pages (`inplace::shown_elsewhere`), read anything it changes.
+/// With `1` only those are flushed and dropped; the others stay pending (done at the next
+/// flush, reading bytes this write did not change) and ahead. `verify`: done as before, and
+/// for up to 16 of the refreshes that would have stayed pending (64 KiB or less) the title's
+/// bytes are kept before the write and compared after it: bytes that differ are counted (must
+/// be 0; the title's own threads writing meanwhile would count too).
+fn narrow_writes() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_NARROW_WRITES").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// [`narrow_writes`]'s counters since the start: writes looked at, refreshes left pending,
+/// copies kept ahead, refreshes compared, bytes that differed.
+static NARROW: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The title addresses `[at, at + len)` changes: itself and every other view of its pages.
+fn written_views(at: usize, len: usize) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 1 << 16;
+    let end = at + len;
+    let mut out = vec![(at, end)];
+    for (block, others) in crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, end) {
+        let (from, to) = (at.max(block), end.min(block + BLOCK));
+        if from >= to {
+            continue;
+        }
+        for other in others {
+            out.push((other + (from - block), other + (to - block)));
+        }
+    }
+    out
+}
+
+/// (Coder W) `VICTORY_ASK_KEPT_EARLY=1` ([`Batch::flush_all`]).
+fn ask_kept_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_KEPT_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// (Coder W, diagnostics) Flushes that left the ask ahead out ([`ask_kept_early`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) static KEPT_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (Fox port C2, from victory-dev / upstream VIctory 6d021fe;
+/// `VICTORY_REFRESH_ONCE=1`, default off = cool_fox) A copy's range brought up
+/// to date in a submission is not asked again in it until a step of ours
+/// writes title memory there. Fox has the skip (`Batch::ahead`, from
+/// `VICTORY_REFRESH_AHEAD` / `_FRONT`) but clears it at every title copy (4,700
+/// a frame in run-103) and fills it only ahead of the steps: there 19,922
+/// refresh steps a frame (22 GB of ranges) became 7,593 refreshes in 64
+/// flushes, 6,480 of them finding nothing new, and 461 write-watch askings
+/// (8.3 ms, 8.5 GB checked, 8.4 GB unchanged). With this: a title copy trims
+/// only the ranges it overlaps (the larger side stays), and what a flush
+/// brought up to date joins the skip. What the title's other threads write
+/// meanwhile is taken by the next submission (as `watch::once` has it).
+/// Counted in copystat's "refreshes ..., N skipped M MB".
+/// `=verify`: every skip is decided, the refresh done all the same, and a
+/// refresh that took bytes is counted ("refreshes the skip would have
+/// missed": must read 0 for `=1` to be adopted).
+fn refresh_once() -> Once {
+    static ON: OnceLock<Once> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_REFRESH_ONCE").as_deref().map(str::trim) {
+        Ok("1") => Once::On,
+        Ok("verify") => Once::Verify,
+        _ => Once::Off,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Once {
+    Off,
+    On,
+    Verify,
+}
+
+/// (`VICTORY_REFRESH_ONCE=verify`) Since the start: skips checked, of them
+/// those whose refresh took bytes (the skip would have missed them), and
+/// those bytes.
+static ONCE_VERIFY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// (`VICTORY_REFRESH_ONCE=verify`) The refresh a skip leaves out, done here.
+fn once_verify(shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    let copied = shadow.update(address, len);
+    let n = ONCE_VERIFY[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if copied > 0 {
+        let missed = ONCE_VERIFY[1].fetch_add(1, Ordering::Relaxed) + 1;
+        ONCE_VERIFY[2].fetch_add(copied as u64, Ordering::Relaxed);
+        if missed <= 16 || missed.is_power_of_two() {
+            let (start, bytes) = shadow.span();
+            tracing::warn!(
+                missed,
+                copy = shadow.id(),
+                copy_start = format_args!("{start:#x}"),
+                copy_bytes = bytes,
+                in_place = shadow.in_place(),
+                address = format_args!("{address:#x}"),
+                len,
+                taken = copied,
+                "VICTORY_REFRESH_ONCE=verify: a refresh the skip would have left out took bytes"
+            );
+        }
+    }
+    if n.is_power_of_two() && n >= 1024 {
+        tracing::info!(
+            "VICTORY_REFRESH_ONCE=verify, since the start: skips checked {n}, refreshes the skip would have missed {} ({:.1} MB)",
+            ONCE_VERIFY[1].load(Ordering::Relaxed),
+            ONCE_VERIFY[2].load(Ordering::Relaxed) as f64 / 1048576.0
+        );
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8977,6 +9156,15 @@ fn wide_fills() -> bool {
 /// buffer then holds (`texture.rs`, `dirty`) may come ahead of the refresh
 /// an earlier list of the submission asked for, not behind it. The texture
 /// is then uploaded by a later list too, once more than needed.
+/// (Fox port C2, from victory-dev P6; `VICTORY_PREPARE_WIDE=1`, default off =
+/// cool_fox) Fox already gathers fills and refreshes and runs them on the wide
+/// workers; ours goes wide earlier: fills from 32 (fox 96) and a flush's
+/// refreshes from 2 copies (fox 4).
+fn prepare_wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PREPARE_WIDE").is_some_and(|v| v == "1"))
+}
+
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
@@ -8994,6 +9182,26 @@ impl Batch {
             && end <= to
         {
             self.last_ahead = (key, from, to);
+            return;
+        }
+        // (`VICTORY_REFRESH_ONCE`) Brought up to date by a flush of this
+        // submission, and no step of ours wrote title memory there since.
+        if !self.once.is_empty()
+            && refresh_once() != Once::Off
+            && self.once.get(&key).is_some_and(|&(from, to)| from <= address && end <= to)
+        {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            if refresh_once() == Once::On {
+                return;
+            }
+            // `=verify`: the refresh is done here all the same (the title's
+            // bytes are what the flush would find: nothing of ours wrote them
+            // since), and what it takes is what the skip would have missed.
+            once_verify(shadow, address, len);
             return;
         }
         let found = if key == self.last_index.0 {
@@ -9039,8 +9247,15 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+        let timed = (crate::copystep::clean_stamp() != 0).then(std::time::Instant::now);
+        let kind = if crate::watch::light() && shadow.nothing_new(from, to - from) {
+            0
+        } else {
             Self::update(&shadow, from, to);
+            1
+        };
+        if let Some(at) = timed {
+            crate::copystep::flushed(kind, at);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -9080,7 +9295,136 @@ impl Batch {
         self.flush();
         self.ahead.clear();
         self.last_ahead = (0, 0, 0);
+        self.once.clear();
         self.textures.clear();
+    }
+
+    /// [`Batch::title_written`] for a write of ours into `[at, at + len)`.
+    /// (`VICTORY_REFRESH_ONCE=1`) Of a copy brought up to date in this
+    /// submission that holds some of those bytes, the larger part beside them
+    /// stays so (fox: every copy is asked again after every title copy).
+    fn title_written_at(&mut self, at: usize, len: usize) {
+        self.narrow_verify();
+        match narrow_writes() {
+            1 => self.written_narrow(at, len),
+            mode => {
+                if mode == 2 {
+                    self.narrow_keep(at, len);
+                }
+                self.flush();
+                // Fox's skip goes whole, as before.
+                self.ahead.clear();
+                self.last_ahead = (0, 0, 0);
+            }
+        }
+        if refresh_once() != Once::Off {
+            let end = at + len;
+            self.once.retain(|_, entry| {
+                let (from, to) = *entry;
+                if end <= from || to <= at {
+                    return true;
+                }
+                let (left, right) = (at.saturating_sub(from), to.saturating_sub(end));
+                if left >= right {
+                    entry.1 = from + left;
+                } else {
+                    entry.0 = end;
+                }
+                entry.0 < entry.1
+            });
+        }
+        self.textures.clear();
+    }
+
+    /// (Coder W, `VICTORY_NARROW_WRITES=1`) [`Batch::title_written_at`]'s flush and drop, for
+    /// what lies over the written bytes or another view of them only.
+    fn written_narrow(&mut self, at: usize, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hit = written_views(at, len);
+        let meets = |from: usize, to: usize| hit.iter().any(|&(a, b)| from < b && a < to);
+        NARROW[0].fetch_add(1, Relaxed);
+        self.refresh_textures();
+        let over: Vec<std::sync::Arc<crate::shadow::Shadow>> =
+            self.refreshes.iter().filter(|r| meets(r.1, r.2)).map(|r| r.0.clone()).collect();
+        NARROW[1].fetch_add((self.refreshes.len() - over.len()) as u64, Relaxed);
+        for shadow in over {
+            self.flush_one(&shadow);
+        }
+        let before = self.ahead.len();
+        self.ahead.retain(|_, r| !meets(r.0, r.1));
+        self.last_ahead = (0, 0, 0);
+        NARROW[2].fetch_add(self.ahead.len() as u64, Relaxed);
+        let _ = before;
+        if NARROW[0].load(Relaxed) % 4096 == 1 {
+            tracing::info!(
+                "narrow writes (VICTORY_NARROW_WRITES=1), since the start: {} writes, {} refreshes left pending, {} copies kept ahead",
+                NARROW[0].load(Relaxed),
+                NARROW[1].load(Relaxed),
+                NARROW[2].load(Relaxed)
+            );
+        }
+    }
+
+    /// (`VICTORY_NARROW_WRITES=verify`) Before a write of ours: the bytes of refreshes the
+    /// narrow path would leave pending.
+    fn narrow_keep(&mut self, at: usize, len: usize) {
+        let hit = written_views(at, len);
+        let meets = |from: usize, to: usize| hit.iter().any(|&(a, b)| from < b && a < to);
+        NARROW[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for r in self.refreshes.iter().filter(|r| !meets(r.1, r.2) && r.2 - r.1 <= 64 << 10).take(16) {
+            let mut bytes = vec![0u8; r.2 - r.1];
+            if read_into(r.1 as *const u8, &mut bytes) {
+                self.narrow_checks.push((r.1, bytes));
+            }
+        }
+    }
+
+    /// (`VICTORY_NARROW_WRITES=verify`) After the write: what was kept, compared.
+    fn narrow_verify(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.narrow_checks.is_empty() {
+            return;
+        }
+        for (at, was) in std::mem::take(&mut self.narrow_checks) {
+            let mut now = vec![0u8; was.len()];
+            if !read_into(at as *const u8, &mut now) {
+                continue;
+            }
+            NARROW[3].fetch_add(1, Relaxed);
+            let differ = now.iter().zip(&was).filter(|(a, b)| a != b).count() as u64;
+            if differ > 0 {
+                let n = NARROW[4].fetch_add(differ, Relaxed);
+                if n < 4096 {
+                    tracing::warn!(at = format_args!("{at:#x}"), differ, "narrow writes (verify): a refresh left pending would have read changed bytes");
+                }
+            }
+        }
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, Relaxed) % 2048 == 0 {
+            tracing::info!(
+                "narrow writes (VICTORY_NARROW_WRITES), since the start: {} writes, {} refreshes left pending, {} copies kept ahead, {} compared; MUST BE 0: bytes that differ {}",
+                NARROW[0].load(Relaxed),
+                NARROW[1].load(Relaxed),
+                NARROW[2].load(Relaxed),
+                NARROW[3].load(Relaxed),
+                NARROW[4].load(Relaxed)
+            );
+        }
+    }
+
+    /// (`VICTORY_REFRESH_ONCE=1`) `[from, to)` of the copy `key` is up to date
+    /// in this submission: kept with what was, joined if they touch, else the
+    /// larger of the two.
+    fn brought(&mut self, key: usize, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let entry = self.once.entry(key).or_insert((from, to));
+        if from <= entry.1 && entry.0 <= to {
+            (entry.0, entry.1) = (entry.0.min(from), entry.1.max(to));
+        } else if to - from > entry.1 - entry.0 {
+            *entry = (from, to);
+        }
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -9197,27 +9541,41 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !(ask_kept_early() && crate::watch::once_kept());
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+        let inline_small = due.is_empty()
+            && (spans.len() <= 1
+                || (spans.len() < 4 && spans.iter().map(|s| s.2 - s.1).sum::<usize>() < (64 << 10)));
+        if inline_small {
+            for (shadow, from, to) in &spans {
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Self::update(shadow, *from, *to);
             }
-            Self::update(shadow, *from, *to);
-        });
+        } else {
+            crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[i];
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9262,12 +9620,22 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
-                Self::update(shadow, *from, *to);
+        let inline_small = due.len() <= 1
+            || (due.len() < 4 && due.iter().map(|d| d.2 - d.1).sum::<usize>() < (64 << 10));
+        if inline_small {
+            for (shadow, from, to) in &due {
+                if !shadow.nothing_new(*from, *to - *from) {
+                    Self::update(shadow, *from, *to);
+                }
             }
-        });
+        } else {
+            crate::shadow::wide_each(due.len(), move |i| {
+                let (shadow, from, to) = &due[i];
+                if !shadow.nothing_new(*from, *to - *from) {
+                    Self::update(shadow, *from, *to);
+                }
+            });
+        }
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
@@ -9288,7 +9656,9 @@ impl Batch {
             return;
         }
         let started = std::time::Instant::now();
-        if self.fills.len() < FEW {
+        // (`VICTORY_PREPARE_WIDE=1`) Wide from 32 fills, as the old tree's P6.
+        let few = if prepare_wide() { 32 } else { FEW };
+        if self.fills.len() < few {
             for (dst, src, len) in self.fills.drain(..) {
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
             }
@@ -9347,6 +9717,16 @@ impl Batch {
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
+        // (`VICTORY_REFRESH_ONCE=1`) What this flush brings up to date is not
+        // asked again in the submission until a step writes title memory
+        // there (noted now: the flush is done before the next step).
+        if refresh_once() != Once::Off {
+            let done: Vec<(usize, usize, usize)> =
+                self.refreshes.iter().map(|(shadow, from, to)| (std::sync::Arc::as_ptr(shadow) as usize, *from, *to)).collect();
+            for (key, from, to) in done {
+                self.brought(key, from, to);
+            }
+        }
         let light = crate::watch::light();
         // Renderer port #6: looked at on the threads beside, below.
         let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
@@ -9361,7 +9741,19 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // (Coder W, `VICTORY_ASK_KEPT_EARLY=1`, default off) With the submission's one asking
+        // standing (`VICTORY_ASK_ONCE`, on), `ask_ahead` returns after filtering and sorting
+        // every range and `ask_ahead_done` takes the journal's write lock to do nothing: both
+        // are left out. Exact: neither changes anything then.
+        let skip = ask_kept_early() && crate::watch::once_kept();
+        #[cfg(feature = "diagnostics")]
+        if skip && self.refreshes.len() > 1 {
+            let n = KEPT_EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() || n % 10_000 == 0 {
+                tracing::info!(n, "asks ahead left out with the submission's asking standing (VICTORY_ASK_KEPT_EARLY=1), since the start");
+            }
+        }
+        let ahead = self.refreshes.len() > 1 && !skip;
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -9373,7 +9765,14 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        let wide_threshold = if prepare_wide()
+            && self.refreshes.iter().map(|r| r.2 - r.1).sum::<usize>() >= (64 << 10)
+        {
+            2
+        } else {
+            4
+        };
+        if wide_refresh() && self.refreshes.len() >= wide_threshold {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -10041,6 +10440,13 @@ impl Meter {
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
+            crate::draw::table_memo_line(frames);
+            crate::draw::table_named_only_line(frames);
+            crate::draw::bind_same_line(frames);
+            crate::draw::list_alias_line(frames);
+            crate::descriptor::host::queue_marks_line(frames);
+            crate::resource::e5_line(frames);
+            crate::pipeline::library::samplers_line();
             crate::tiles::status();
             {
                 let [queued, due, away, partly, oldest] =

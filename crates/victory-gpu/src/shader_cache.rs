@@ -76,7 +76,12 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_BVH_MISS",
+            "VICTORY_BVH_PAGE_REUSE",
             "VICTORY_NAN_SCRUB",
+            "VICTORY_HOIST_LOADS",
+            "VICTORY_ONE_MODE_PER_REGISTER",
+            "VICTORY_SPILL_STRICT",
+            "VICTORY_RDNA_FLOAT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -95,6 +100,9 @@ fn build() -> [u8; 32] {
         }
         if victory_shader::emit::slot_remap() {
             bytes.extend_from_slice(b"VICTORY_SLOT_REMAP=1");
+        }
+        if victory_shader::emit::probe_rays() {
+            bytes.extend_from_slice(b"VICTORY_PROBE_RAYS=1\0");
         }
         // Ray-tracing node tests answering no hit (`VICTORY_BVH_NO_HIT=1`,
         // opt-in; off by default and never active with `VICTORY_BVH_BUILDER=1`).
@@ -151,8 +159,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // The build fingerprint in the input does the versioning; bumped when
+        // the on-disk record format (`MAGIC`) adds fields.
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -193,7 +202,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -284,6 +293,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    // (Fox T, `VICTORY_TABLE_NAMED_ONLY`) The table descriptors the code reads; u32::MAX: not known.
+    match &s.table_reads {
+        None => word(&mut out, u32::MAX),
+        Some(reads) => {
+            word(&mut out, reads.len() as u32);
+            for &(slot, k) in reads {
+                word(&mut out, u32::from(slot));
+                word(&mut out, k);
+            }
+        }
+    }
     out
 }
 
@@ -352,6 +372,16 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()?;
+    let table_reads = if n == u32::MAX {
+        None
+    } else {
+        let mut reads = Vec::with_capacity((n as usize).min(1024));
+        for _ in 0..n {
+            reads.push((u8::try_from(r.word()?).ok()?, r.word()?));
+        }
+        Some(reads)
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -362,6 +392,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        table_reads,
     })
 }
 
@@ -396,6 +427,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            table_reads: Some(vec![(1, 0), (1, 3), (2, u32::MAX)]),
         }
     }
 
@@ -420,7 +452,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -446,11 +478,17 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&shader());
-        assert_eq!(decode(&bytes), Some(shader()));
+        let s = shader();
+        let bytes = encode(&s);
+        assert_eq!(decode(&bytes), Some(s.clone()));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
+        assert_eq!(decode(b"VSH1"), None);
         assert_eq!(decode(b"VSH0"), None);
+
+        let none = HostShader { table_reads: None, ..s };
+        let none_bytes = encode(&none);
+        assert_eq!(decode(&none_bytes), Some(none));
     }
 
     /// Toggling `VICTORY_BVH_NO_HIT` or `VICTORY_BVH_BUILDER` separates the

@@ -257,6 +257,56 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// (Fox T, foxhound 7fa0e95) Whether the pipeline this thread makes has
+    /// static samplers ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// (Fox T, port of foxhound 7fa0e95) The pipelines this thread makes while
+/// the guard lives have static samplers (`samplers`). With
+/// `VICTORY_SAMPLERS_MADE=1` (default off) they are made every run, never
+/// loaded from or stored in the library.
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers))
+}
+
+/// See [`with_static_samplers`]; the setting before it comes back on drop.
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_SAMPLERS_MADE=1`: see [`with_static_samplers`].
+fn samplers_made() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLERS_MADE").is_some_and(|v| v == "1"))
+}
+
+/// Pipelines with static samplers: loaded from the library (each one may read
+/// through other samplers than its own), made, made because of the switch.
+static WITH_SAMPLERS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static SAMPLERS_SAID: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// For the frame lines: the counts since the start, when they changed.
+pub(crate) fn samplers_line() {
+    let v: [u64; 3] = std::array::from_fn(|i| WITH_SAMPLERS[i].load(Ordering::Relaxed));
+    let sum = v[0] << 42 ^ v[1] << 21 ^ v[2];
+    if SAMPLERS_SAID.swap(sum, Ordering::Relaxed) == sum {
+        return;
+    }
+    if v == [0, 0, 0] {
+        return;
+    }
+    tracing::info!(
+        "pipelines with static samplers since the start (VICTORY_SAMPLERS_MADE={}): {} loaded from the library (may sample through another run's samplers), {} made, of them {} kept out of the library by the switch",
+        u8::from(samplers_made()),
+        v[0],
+        v[1] + v[2],
+        v[2],
+    );
 }
 
 /// Names the pipeline this thread makes next.
@@ -522,8 +572,12 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let samplers = STATIC_SAMPLERS.get();
+    let Some(library) = library().filter(|_| !(samplers && samplers_made())) else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        if samplers {
+            WITH_SAMPLERS[if samplers_made() { 2 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+        }
         return create();
     };
     let began = std::time::Instant::now();
@@ -539,6 +593,9 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            if samplers {
+                WITH_SAMPLERS[0].fetch_add(1, Ordering::Relaxed);
+            }
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -561,6 +618,9 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    if samplers {
+        WITH_SAMPLERS[1].fetch_add(1, Ordering::Relaxed);
+    }
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(

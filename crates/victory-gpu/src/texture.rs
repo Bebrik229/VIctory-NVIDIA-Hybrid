@@ -672,6 +672,21 @@ thread_local! {
 /// refresh, and there is none: the buffer goes with the upload. Asking guards
 /// the texture's blocks (a change of protection, under the lock every other
 /// refresh wants), and the title's next write there faults to open them.
+/// (C3) `VICTORY_BAKE_DELTA=1`: skip re-uploading bake sources whose host copy
+/// already holds their current memory bytes.
+pub(crate) fn bake_delta_on() -> bool {
+    bake_delta()
+}
+
+fn bake_delta() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BAKE_DELTA").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// (C3) Bake uploads left out by `VICTORY_BAKE_DELTA`: skipped uploads, bytes,
+/// and bake-flush slots whose host copy held their bytes already.
+pub(crate) static BAKE_SKIPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
@@ -762,6 +777,21 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     use std::sync::atomic::Ordering::Relaxed;
     let baking = BAKING.get();
+    // (C3) `VICTORY_BAKE_DELTA=1`: a bake's source that a submitted list
+    // uploaded, not detiled since, and whose memory nothing has written since
+    // the staging buffer was last filled holds on the card what its memory holds.
+    if baking
+        && bake_delta()
+        && staging.uploaded.load(Relaxed)
+        && !staging.dirty.load(Relaxed)
+        && !staging.on_demand
+        && staging.unwritten_since_filled()
+    {
+        BAKE_SKIPPED[0].fetch_add(1, Relaxed);
+        BAKE_SKIPPED[1].fetch_add(staging.bytes, Relaxed);
+        list.defer_texture(staging);
+        return;
+    }
     if baking {
         staging.exact.store(true, Relaxed);
     }
@@ -1224,6 +1254,27 @@ impl Staging {
     fn note_held(&self) {
         let hash = self.last.lock().unwrap_or_else(|e| e.into_inner()).hash;
         *self.holds.lock().unwrap_or_else(|e| e.into_inner()) = hash.map(|hash| (self.first, hash));
+    }
+
+    /// (C3, `VICTORY_BAKE_DELTA`) Whether nothing has written the texture's
+    /// memory since the staging buffer was last filled.
+    fn unwritten_since_filled(&self) -> bool {
+        let (start, size) = (self.memory as usize, self.read);
+        let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.asked == 0 || last.hash.is_none() && self.once.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        if let Some((_, written)) = crate::watch::writes(start, start + size, false) {
+            return written.iter().all(|&(_, w)| w <= last.asked);
+        }
+        let hot = hot_textures() && crate::frame::current() < last.hot_until;
+        if hot || last.hot_until == 0 {
+            return false;
+        }
+        match crate::watch::writes(start, start + size, true) {
+            Some((_, written)) => written.iter().all(|&(_, w)| w <= last.asked),
+            None => false,
+        }
     }
 
     /// Detiles the texture memory into the staging buffer if it changed

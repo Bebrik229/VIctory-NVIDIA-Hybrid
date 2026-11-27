@@ -36,6 +36,14 @@ pub const SLOT_TABLE_STRIDES: u8 = 252;
 pub const SLOT_REMAP: u8 = 251;
 /// Dwords in the [`SLOT_REMAP`] buffer (`2^21` = 2,097,152 virtual slots = 8 MiB).
 pub const SLOT_REMAP_COUNT: u32 = 1 << 21;
+/// (Fox T, diagnostics meter `VICTORY_BVH_WALK=1`) The root UAV `u<SLOT_WALK>` in
+/// [`ROOT_CBV_SPACE`]: [`WALK_SLOTS`] dwords, one per thread of a dispatch (its
+/// `SV_DispatchThreadID` x + 4096 y, modulo the slots); each ray-tracing node test a
+/// thread runs adds 1 (a box node) or 0x10000 (a triangle) to its dword. The host reads
+/// the buffer back after each dispatch that has it.
+pub const SLOT_WALK: u8 = 251;
+/// Dwords of the [`SLOT_WALK`] buffer.
+pub const WALK_SLOTS: u32 = 1 << 22;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -106,11 +114,35 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// (Fox T, `VICTORY_NAN_METER=1`) `RootType::Other` code of a user-data dword
+/// the host sets: the program's place in the [`SLOT_NAN`] buffer.
+pub const USER_NAN_SLOT: u32 = 0x107;
+/// (Fox T, `VICTORY_PROBE_RAYS=1`) `RootType::Other` code of a user-data dword
+/// the host sets: nonzero while the title's ray-tracing structures are not
+/// built (the structure builder is off). A node test then answers as for a
+/// structure with nothing in it.
+pub const USER_BVH_EMPTY: u32 = 0x108;
+/// (Fox T, `VICTORY_NAN_METER=1`) The root UAV `u<SLOT_NAN>` in
+/// [`ROOT_CBV_SPACE`]: per program ([`USER_NAN_SLOT`]) four dwords: NaNs and
+/// infinities stored through typed views (images, typed buffers), NaNs and
+/// infinities exported to float colour targets. Counted where they are made,
+/// before any guard.
+pub const SLOT_NAN: u8 = 250;
+/// Programs the [`SLOT_NAN`] buffer has room for.
+pub const NAN_SLOTS: u32 = 1 << 14;
+/// (Fox T, `VICTORY_NAN_ORIGIN`) After the programs' counts, per program named
+/// there (by its code's tag, [`code_tag`]), one dword per instruction dword of
+/// its code: how many float results that instruction made that are NaN.
+pub const NAN_ORIGIN_DWORDS: u32 = 1 << 14;
+/// Programs `VICTORY_NAN_ORIGIN` can name.
+pub const NAN_ORIGINS: u32 = 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
@@ -187,6 +219,27 @@ pub fn slot_remap() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_REMAP").is_some_and(|v| v == "1"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_raw`].
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
+/// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
+/// so the host can give the card the title's bytes where they are (16-byte aligned, which a
+/// constant buffer view cannot take) instead of a copy made at every submission. The host's
+/// views must follow: the twin of every constant buffer's slot a raw view of its bytes. Part of
+/// the translation: the shader cache keys on the switch.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Where the host's raw twins of its buffer views start in its view heaps (0: there are none).
 ///
 /// A buffer a shader picks from the heap by an index it computes is read as raw bytes whatever
@@ -211,27 +264,6 @@ thread_local! {
 pub fn set_raw_views(first: u32) {
     debug_assert!(first == 0 || first.is_power_of_two());
     RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-thread_local! {
-    /// For a test's thread alone: [`constants_raw`].
-    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
-/// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
-/// so the host can give the card the title's bytes where they are (16-byte aligned, which a
-/// constant buffer view cannot take) instead of a copy made at every submission. The host's
-/// views must follow: the twin of every constant buffer's slot a raw view of its bytes. Part of
-/// the translation: the shader cache keys on the switch.
-pub fn constants_raw() -> bool {
-    #[cfg(test)]
-    if let Some(on) = CONSTANTS_RAW_HERE.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
@@ -634,6 +666,7 @@ impl Shader {
                 (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::DOUBLES, used.doubles),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),

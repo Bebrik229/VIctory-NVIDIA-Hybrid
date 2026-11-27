@@ -49,7 +49,7 @@ fn class() -> usize {
             Some("victory-submit") => SUBMIT,
             Some("victory-late-wait") => LATE,
             Some("victory-relay") => RELAY,
-            Some("victory-reaper") => REAPER,
+            Some(n) if n.starts_with("victory-reaper") => REAPER,
             _ => OTHER,
         };
     }
@@ -64,40 +64,63 @@ struct Job(Box<dyn FnOnce()>);
 // them, and the host's `Retired`; nothing else names them.
 unsafe impl Send for Job {}
 
-/// The reaper's queue, `None` when off or when no thread could be made.
-fn reaper() -> Option<&'static Sender<Job>> {
+struct Reapers {
+    txs: Vec<Sender<Job>>,
+    next: AtomicU64,
+}
+
+/// The reaper's workers (`0`: list recycle + drops; `1`: extra drop worker),
+/// `None` when off or when no thread could be made.
+fn reapers() -> Option<&'static Reapers> {
     if !on() {
         return None;
     }
-    static REAPER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
-    REAPER
+    static REAPERS: OnceLock<Option<Reapers>> = OnceLock::new();
+    REAPERS
         .get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<Job>();
-            let made = std::thread::Builder::new().name("victory-reaper".into()).spawn(move || {
-                for Job(work) in rx {
-                    work();
-                }
-            });
-            match made {
-                Ok(_) => {
-                    tracing::info!("VICTORY_REAPER=1: landed host lists are reset and retired objects dropped on the thread victory-reaper");
-                    Some(tx)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "no reaper thread: host lists are reset where they land");
-                    None
+            let mut txs = Vec::with_capacity(2);
+            for i in 0..2usize {
+                let (tx, rx) = std::sync::mpsc::channel::<Job>();
+                let thread_name = if i == 0 {
+                    "victory-reaper".to_owned()
+                } else {
+                    format!("victory-reaper-{i}")
+                };
+                match std::thread::Builder::new().name(thread_name).spawn(move || {
+                    for Job(work) in rx {
+                        work();
+                    }
+                }) {
+                    Ok(_) => txs.push(tx),
+                    Err(e) if i == 0 => {
+                        tracing::warn!(error = %e, "no reaper thread: host lists are reset where they land");
+                        return None;
+                    }
+                    Err(_) => {}
                 }
             }
+            tracing::info!(
+                workers = txs.len(),
+                "VICTORY_REAPER=1: landed host lists are reset and retired objects dropped on background reaper threads"
+            );
+            Some(Reapers {
+                txs,
+                next: AtomicU64::new(0),
+            })
         })
         .as_ref()
 }
 
-/// Runs `work`, or has the reaper run it; `work` is counted on the thread
-/// that runs it.
-fn run(work: impl FnOnce() + 'static) {
-    match reaper() {
-        Some(tx) => {
-            if let Err(std::sync::mpsc::SendError(Job(work))) = tx.send(Job(Box::new(work))) {
+/// Runs `work` on a background reaper worker (`ordered`: pinned to worker 0), or inline when off.
+fn run(ordered: bool, work: impl FnOnce() + 'static) {
+    match reapers() {
+        Some(r) => {
+            let idx = if ordered || r.txs.len() == 1 {
+                0
+            } else {
+                (r.next.fetch_add(1, Relaxed) as usize) % r.txs.len()
+            };
+            if let Err(std::sync::mpsc::SendError(Job(work))) = r.txs[idx].send(Job(Box::new(work))) {
                 work();
             }
         }
@@ -112,7 +135,7 @@ pub(crate) fn recycle(lists: Vec<crate::list::Detached>, ran: Vec<usize>) {
     if lists.is_empty() {
         return;
     }
-    run(move || {
+    run(true, move || {
         let started = std::time::Instant::now();
         let n = lists.len() as u64;
         crate::list::recycle(lists, &ran);
@@ -124,7 +147,7 @@ pub(crate) fn recycle(lists: Vec<crate::list::Detached>, ran: Vec<usize>) {
 
 /// Drops `objects`, retired and due, on the reaper if there is one.
 pub(crate) fn dispose<T: 'static>(objects: T) {
-    run(move || {
+    run(false, move || {
         let started = std::time::Instant::now();
         drop(objects);
         let c = class();

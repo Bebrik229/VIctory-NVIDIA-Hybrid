@@ -67,6 +67,8 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        // (Coder W) A stamp of a range over it is no more ([`BlockSeqs`]).
+        bump_block(page);
         let before = self.written.get(&page).copied().unwrap_or(0);
         self.written.insert(page, before.max(now));
         if parts == WHOLE || !parts_on() {
@@ -547,6 +549,74 @@ impl Port7Counts {
     }
 }
 
+/// (Coder W, `VICTORY_CLEAN_STAMP`) Per 64 KiB block, the number of the last change of what
+/// [`nothing_new`] reads of it when its blocks are known by their bits: a journal note of the
+/// block, its published bit cleared, a write beside its guard. Numbers come from one counter,
+/// so "no block of a range changed since number `n`" is a walk over the range's blocks with
+/// no lock. A range found clean by its bits with the counter at `n` (read before the look) is
+/// clean while every block's number is still at most `n` (the copy's own notes only grow more
+/// current; shaders' ranges in flight clear the copy's stamp).
+struct BlockSeqs([std::sync::atomic::AtomicPtr<[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]>; BlockSeqs::PIECES]);
+
+impl BlockSeqs {
+    /// Blocks of a piece (1 GiB).
+    const IN_PIECE: usize = 1 << 14;
+    /// 128 TiB.
+    const PIECES: usize = 1 << 17;
+
+    fn piece(&self, block: usize) -> Option<&[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]> {
+        let p = self.0.get(block / Self::IN_PIECE)?.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: null, or a piece made by `bump_block`, never freed.
+        unsafe { p.as_ref() }
+    }
+}
+
+static BLOCK_SEQS: BlockSeqs = BlockSeqs([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; BlockSeqs::PIECES]);
+static BLOCK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The number a look about to begin is stamped with.
+pub(crate) fn block_seq_now() -> u64 {
+    BLOCK_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Block `block` changed (see [`BlockSeqs`]).
+fn bump_block(block: usize) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    if crate::copystep::skip_unused_stamps() {
+        return;
+    }
+    let Some(place) = BLOCK_SEQS.0.get(block / BlockSeqs::IN_PIECE) else {
+        return;
+    };
+    if place.load(Acquire).is_null() {
+        let piece: Box<[std::sync::atomic::AtomicU64; BlockSeqs::IN_PIECE]> =
+            Box::new([const { std::sync::atomic::AtomicU64::new(0) }; BlockSeqs::IN_PIECE]);
+        let piece = Box::into_raw(piece);
+        if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+            // SAFETY: made just now, and another thread's is there.
+            drop(unsafe { Box::from_raw(piece) });
+        }
+    }
+    let n = BLOCK_SEQ.fetch_add(1, AcqRel) + 1;
+    if let Some(piece) = BLOCK_SEQS.piece(block) {
+        piece[block % BlockSeqs::IN_PIECE].fetch_max(n, Release);
+    }
+}
+
+/// Whether no block of `[start, end)` changed after number `n` ([`BlockSeqs`]).
+pub(crate) fn blocks_unchanged_since(start: usize, end: usize, n: u64) -> bool {
+    if start >= end {
+        return true;
+    }
+    (start / BLOCK..end.div_ceil(BLOCK))
+        .all(|b| BLOCK_SEQS.piece(b).is_none_or(|p| p[b % BlockSeqs::IN_PIECE].load(std::sync::atomic::Ordering::Acquire) <= n))
+}
+
+/// Whether every block of `[start, end)` is known clean by its bits ([`published`]).
+pub(crate) fn known_by_bits(start: usize, end: usize) -> bool {
+    published(start, end)
+}
+
 /// Since the last line: waits and nanoseconds of waiting, of all threads, for
 /// the ranges held ([`ASKING`]), the journal to read it, the journal to note
 /// in it, and the guards (faults of the title's among them).
@@ -994,6 +1064,11 @@ fn ask_early(every: std::time::Duration) {
 }
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
+/// (Coder W) Whether the submission's one asking stands ([`ask_once`]).
+pub(crate) fn once_kept() -> bool {
+    journal().kept
+}
+
 pub(crate) fn ask_ahead_done() {
     // Renderer port #7: nothing to change is seen shared.
     if port_journal() {
@@ -1036,9 +1111,31 @@ pub(crate) fn once() -> bool {
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
+fn guard_blocks_parallel(spans: &[(usize, usize)]) -> (Vec<usize>, bool) {
+    let mut out = Vec::new();
+    let mut any_some = false;
+    for &(first, last) in spans {
+        if let Some(blocks) = guard(first * PAGE, last * PAGE) {
+            any_some = true;
+            out.extend(blocks);
+        }
+    }
+    (out, any_some)
+}
+
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    ask_once_submission(ranges, &[]);
+}
+
+/// [`ask_once`] combined with [`ask_once_guarded`] under one [`Asking::hold_all`],
+/// one journal update, and parallel `guard` passes when `VICTORY_PORT_GUARD` is enabled.
+pub(crate) fn ask_once_submission(ranges: &[(usize, usize)], guarded_in: &[(usize, usize)]) {
     if !once() {
         return;
+    }
+    // (Coder W, `VICTORY_ASK_ONCE_GUARDS=verify`) A new submission's early blocks.
+    if ask_once_guards() != 0 {
+        early_reset();
     }
     let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
@@ -1048,13 +1145,18 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     ask_ahead_held(ranges, true);
     spent.next("asking: the rest");
-    ask_rest(ranges, true);
+    ask_rest_with(ranges, guarded_in, true);
     spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
+#[cfg(test)]
 fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+    ask_rest_with(ranges, &[], held);
+}
+
+fn ask_rest_with(ranges: &[(usize, usize)], guarded_in: &[(usize, usize)], held: bool) {
     let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
@@ -1066,6 +1168,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
+    // (Coder W, `VICTORY_ASK_ONCE_GUARDS`) View memory the kernel will not answer for.
+    let mut guarded: Vec<(usize, usize)> = Vec::new();
     // Those not held by an asking ahead, each once.
     let mut alone_ranges: Vec<(usize, usize)> = Vec::new();
     let mut held_ahead = Ahead::new();
@@ -1090,9 +1194,53 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
         found
     });
     for (&(first, last), found) in alone_ranges.iter().zip(answers) {
-        if let Some(pages) = found {
-            written.extend(pages);
-            ahead.push((first, last));
+        match found {
+            Some(pages) => {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
+            None => guarded.push((first, last)),
+        }
+    }
+    // (Coder W) The guards of those, once for the submission (merged), as every refresh's
+    // `writes` would ask them: blocks written since their last arming are noted and armed again.
+    let mut armed: Vec<usize> = Vec::new();
+    let mode = ask_once_guards();
+    if mode != 0 && !guarded.is_empty() {
+        guarded.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in guarded {
+            match merged.last_mut() {
+                Some(m) if a <= m.1 => m.1 = m.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        let (blocks, any_some) = guard_blocks_parallel(&merged);
+        let found = blocks.len() as u64;
+        written.extend(blocks.iter().map(|&b| (b, WHOLE)));
+        armed.extend(blocks);
+        if mode == 1 && any_some {
+            ahead.extend(merged);
+        }
+        early_found(&armed, found, false);
+    }
+    let mut extra_armed: Vec<usize> = Vec::new();
+    if mode != 0 && !guarded_in.is_empty() && light() {
+        let mut pages: Vec<(usize, usize)> =
+            guarded_in.iter().filter(|r| r.0 < r.1).map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE))).collect();
+        pages.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (a, b) in pages {
+            match merged.last_mut() {
+                Some(m) if a <= m.1 => m.1 = m.1.max(b),
+                _ => merged.push((a, b)),
+            }
+        }
+        let (blocks, any_some) = guard_blocks_parallel(&merged);
+        extra_armed = blocks;
+        early_found(&extra_armed, extra_armed.len() as u64, false);
+        if mode == 1 && any_some && !ahead.is_empty() {
+            ahead.extend(merged);
         }
     }
     note_hot(&written);
@@ -1100,7 +1248,7 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     // the two parts another thread may have asked about a range of the
     // second, copied it, and the title written it since. Under the first
     // part's number that write was older than the copy, and never copied.
-    if port_journal() {
+    if port_journal() && armed.is_empty() && extra_armed.is_empty() {
         // Renderer port #7: noted shared first (see `ask_ahead_held`).
         let now = note_shared(&written);
         let mut j = journal_mut();
@@ -1115,8 +1263,149 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
+    for &b in &extra_armed {
+        j.notes.note(b, WHOLE, now);
+    }
     j.kept = !ahead.is_empty();
     j.ahead.set(ahead);
+    drop(j);
+    if !extra_armed.is_empty() {
+        armed.extend(extra_armed);
+    }
+    // Noted: what the guards made clean of it is known by its bits from now on (as `writes`).
+    if !armed.is_empty() && light() {
+        publish(&armed);
+    }
+}
+
+/// (Coder W, `VICTORY_ASK_ONCE_GUARDS`) Right after the submission's one asking ([`ask_once`]):
+/// the guards of `ranges` (the guarded copies' spans the submission refreshes, which that asking
+/// leaves out: the kernel refuses view memory we made read-only), asked once, merged: blocks
+/// written since their arming noted and armed again; with `1` the asking stands for them too.
+#[allow(dead_code)]
+pub(crate) fn ask_once_guarded(ranges: &[(usize, usize)]) {
+    let mode = ask_once_guards();
+    if mode == 0 || ranges.is_empty() || !light() {
+        return;
+    }
+    let _all = Asking::hold_all();
+    let mut pages: Vec<(usize, usize)> = ranges.iter().filter(|r| r.0 < r.1).map(|&(a, b)| (a / PAGE, b.div_ceil(PAGE))).collect();
+    pages.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in pages {
+        match merged.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let (armed, any_some) = guard_blocks_parallel(&merged);
+    early_found(&armed, armed.len() as u64, false);
+    {
+        let mut j = journal_mut();
+        let now = next_asking();
+        // (As `wrote`: under the submission's asking its answers stand under this number.)
+        if j.kept {
+            j.ahead_asked = now;
+        }
+        for &b in &armed {
+            j.notes.note(b, WHOLE, now);
+        }
+        if mode == 1 && j.kept && any_some {
+            let mut ahead = j.ahead.take();
+            ahead.extend(merged);
+            j.ahead.set(ahead);
+        }
+    }
+    if !armed.is_empty() {
+        publish(&armed);
+    }
+}
+
+/// (Coder W) `VICTORY_ASK_ONCE_GUARDS`: 0 off, 1 on, 2 verify.
+///
+/// The submission's one asking ([`ask_once`]) asks the kernel only: view memory guarded by us is
+/// refused there and left to `writes`, which walks and arms the guards of each refresh's range
+/// again (run-250: ~200 such asks a frame, ~85 us each). With the switch the guards of all those
+/// ranges are asked once, merged, at the submission's asking (the same `guard`: blocks written
+/// since their arming are noted and armed again), and with `1` the asking stands for them too, so
+/// later refreshes answer from the journal. What a title thread writes there after it is seen by
+/// the next submission's asking, as `ASK_ONCE` already has it for write-watched memory.
+/// `verify`: the early pass runs, the asking does not stand for those ranges (each refresh asks
+/// as today), and the blocks a refresh's guards then find written that the early pass did not are
+/// counted, with how many of them were found late in the submission before as well.
+pub(crate) fn ask_once_guards() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_ASK_ONCE_GUARDS").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("verify") => 2,
+        _ => 0,
+    })
+}
+
+/// (`VICTORY_ASK_ONCE_GUARDS`) The early pass's blocks of this submission, the blocks found late
+/// in the one before, and counters since the last line: early passes, blocks found early, blocks
+/// found late (by a refresh), of them also late the submission before.
+static EARLY_SETS: Mutex<Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>, std::collections::HashSet<usize>)>> = Mutex::new(None);
+static EARLY_N: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn early_reset() {
+    let mut e = EARLY_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    let (now, late, before) = e.get_or_insert_with(Default::default);
+    *before = std::mem::take(late);
+    now.clear();
+}
+
+fn early_found(blocks: &[usize], found: u64, reset: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    EARLY_N[0].fetch_add(1, Relaxed);
+    EARLY_N[1].fetch_add(found, Relaxed);
+    let mut e = EARLY_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    let (now, late, before) = e.get_or_insert_with(Default::default);
+    if reset {
+        *before = std::mem::take(late);
+        now.clear();
+    }
+    now.extend(blocks.iter().copied());
+}
+
+/// (`=verify`) A refresh's guards found `blocks` written.
+fn late_found(blocks: &[usize]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if ask_once_guards() != 2 || blocks.is_empty() {
+        return;
+    }
+    let mut e = EARLY_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((now, late, before)) = e.as_mut() else {
+        return;
+    };
+    for &b in blocks {
+        if !now.contains(&b) && late.insert(b) {
+            EARLY_N[2].fetch_add(1, Relaxed);
+            if before.contains(&b) {
+                EARLY_N[3].fetch_add(1, Relaxed);
+            }
+        }
+    }
+    drop(e);
+    static DUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let due = DUE.load(Relaxed);
+    if ms >= due && DUE.compare_exchange(due, ms + 5000, Relaxed, Relaxed).is_ok() {
+        let frame = crate::frame::current();
+        let frames = frame.saturating_sub(FRAME.swap(frame, Relaxed)).max(1) as f64;
+        let v: [u64; 4] = std::array::from_fn(|i| EARLY_N[i].swap(0, Relaxed));
+        tracing::info!(
+            "guards asked once a submission (VICTORY_ASK_ONCE_GUARDS=verify) per frame: {:.1} early passes found {:.0} blocks written; \
+             refreshes' guards then found {:.1} blocks written that the early pass had not (title writes during preparation; under =1 \
+             seen a submission later), {:.1} of them found late the submission before too (written on all the time)",
+            v[0] as f64 / frames,
+            v[1] as f64 / frames,
+            v[2] as f64 / frames,
+            v[3] as f64 / frames
+        );
+    }
 }
 
 /// Diagnostics: the ranges a submission's asking asks about alone
@@ -1306,7 +1595,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let found = guard(first * PAGE, last * PAGE);
+            if let Some(blocks) = &found {
+                late_found(blocks);
+            }
+            let mut written = found.map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
             if written.is_none() && viewed {
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
@@ -1690,6 +1983,10 @@ impl Bits {
         if let Some(piece) = self.piece(word) {
             piece[word % Bits::WORDS].fetch_or(1 << (block % 64), SeqCst);
         }
+        // (Coder W) Written beside its guard: no longer known clean.
+        if std::ptr::eq(self, &BESIDE) {
+            bump_block(block);
+        }
     }
 
     /// Sets it if it was not set: whether it was not.
@@ -1711,15 +2008,23 @@ impl Bits {
             }
         }
         let bit = 1 << (block % 64);
-        self.piece(word).map(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
+        let was = self.piece(word).map(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0);
+        if was.is_some() && std::ptr::eq(self, &BESIDE) {
+            bump_block(block);
+        }
+        was
     }
 
     /// Whether it was set; it is not now.
     fn clear_was(&self, block: usize) -> bool {
         let word = block / 64;
         let bit = 1 << (block % 64);
-        self.piece(word)
-            .is_some_and(|piece| piece[word % Bits::WORDS].fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit != 0)
+        let was = self.piece(word)
+            .is_some_and(|piece| piece[word % Bits::WORDS].fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit != 0);
+        if was && std::ptr::eq(self, &PUBLISHED) {
+            bump_block(block);
+        }
+        was
     }
 
     /// Those set of `[first, last)`, in order (`last` at most the address
@@ -1782,6 +2087,10 @@ impl Bits {
             // Ahead of the protection's change, and seen by whoever the
             // writer tells of its write.
             piece[word % Bits::WORDS].fetch_and(!(1 << (block % 64)), std::sync::atomic::Ordering::SeqCst);
+        }
+        // (Coder W) Not known by its bit any more.
+        if std::ptr::eq(self, &PUBLISHED) {
+            bump_block(block);
         }
     }
 
@@ -3971,6 +4280,45 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn unused_stamp_profile_preserves_journal_and_allocated_page_writes() {
+        // Each process has a fixed configuration and a fresh write journal.
+        const CHILD: &str = "VICTORY_TEST_EXPECT_STAMPS_SKIPPED";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let skip = expected == "1";
+            assert_eq!(crate::copystep::skip_unused_stamps(), skip);
+            let before = block_seq_now();
+            bump_block(7);
+            assert_eq!(blocks_unchanged_since(7 * BLOCK, 8 * BLOCK, before), skip);
+            assert_eq!(block_seq_now() == before, skip);
+            written_pages_are_reported_to_every_asker();
+            return;
+        }
+        for (experiment, clean, skipped) in [
+            ("0", Some("0"), "0"),
+            ("1", Some("0"), "1"),
+            ("1", Some("1"), "0"),
+            ("1", Some("verify"), "0"),
+            ("1", None, "0"),
+        ] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "watch::tests::unused_stamp_profile_preserves_journal_and_allocated_page_writes"])
+                .env("VICTORY_SKIP_UNUSED_STAMPS", experiment)
+                .env(CHILD, skipped);
+            if let Some(clean) = clean {
+                cmd.env("VICTORY_CLEAN_STAMP", clean);
+            } else {
+                cmd.env_remove("VICTORY_CLEAN_STAMP");
+            }
+            let run = cmd.output().unwrap();
+            assert!(
+                run.status.success(),
+                "experiment={experiment} clean={clean:?}: {}",
+                String::from_utf8_lossy(&run.stdout)
+            );
+        }
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

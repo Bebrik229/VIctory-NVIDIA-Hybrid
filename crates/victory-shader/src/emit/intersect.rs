@@ -25,9 +25,13 @@
 //! Each lane reads only the dwords its node's kind needs: 28 for a 32-bit
 //! box node, 16 for a 16-bit one, 10 for a triangle.
 
-use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, Term, V, Why, flags, pred};
+use super::{Attr, Bin, Fields, Inst, Lower, Operand, Reg, RootType, Term, V, Why, flags, pred};
 use crate::bvh;
 use crate::resource::BvhNodes;
+
+/// (Fox T) Ray-tracing node tests translated with the second half of a 128-byte box
+/// node read through the first half's directory entry (`VICTORY_BVH_PAGE_REUSE=1`).
+pub static PAGES_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -52,8 +56,6 @@ thread_local! {
 /// first node test without loading `SLOT_MEMORY` or touching `SLOT_FAULTS`.
 /// Ported from `fxceless/victory-fork`.
 fn no_hit() -> bool {
-    // Unit tests opt in via `TEST_NO_HIT` so existing traversal tests keep
-    // running the full node test without environment mutation.
     #[cfg(test)]
     {
         TEST_NO_HIT.get()
@@ -73,7 +75,8 @@ enum NodeAt {
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// the node's address, for the second half of a 128-byte node, and
     /// whether there is a copy.
-    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
+    /// (Fox T) `slot`: the heap slot of the view, for [`super::bvh_page_reuse`].
+    Memory { handle: V, byte: V, low: V, high: V, mapped: V, slot: V },
 }
 
 /// The ray operands, as floats.
@@ -82,12 +85,6 @@ struct Ray {
     origin: [V; 3],
     direction: [V; 3],
     inverse: [V; 3],
-}
-
-/// LOCAL: `VICTORY_BVH_MISS=1` (off by default): miss every BVH node without reading it.
-fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
 }
 
 impl<'a> Lower<'a> {
@@ -148,6 +145,25 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing structure that returns triangle ids");
         }
         let guard = self.guard(b, i)?;
+        // (Fox T, `VICTORY_PROBE_RAYS`) An empty structure (the host says so):
+        // no node is read, and the answer is that of an empty one (below).
+        let empty = crate::emit::probe_rays().then(|| {
+            let flag = self.host_word(RootType::Other(crate::emit::USER_BVH_EMPTY), 0, 0);
+            let zero = self.s.m.i32(0);
+            self.s.m.cmp(self.cur, pred::NE, flag, zero)
+        });
+        let whole_guard = guard;
+        let guard = match (empty, guard) {
+            (Some(e), g) => {
+                let t = self.s.m.bool(true);
+                let not_empty = self.s.m.bin(self.cur, Bin::Xor, e, t);
+                Some(match g {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, not_empty),
+                    None => not_empty,
+                })
+            }
+            (None, g) => g,
+        };
         let mut x = Vec::with_capacity(regs.len());
         for &r in &regs {
             let v = inst.read(Reg::V(r)).ok_or("an unread operand")?;
@@ -211,13 +227,14 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped, slot) = self.bvh_memory(low, high, guard);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
+                    slot,
                 }
             }
         };
@@ -229,6 +246,9 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        if crate::emit::bvh_walk() && self.s.threads.is_some() {
+            self.bvh_walk_count(is_box, is_triangle);
+        }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -238,19 +258,11 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = if bvh_miss() {
-            [self.s.m.i32(bvh::NONE); 4]
-        } else {
-            self.bvh_boxes(at, kind, &ray, sort)
-        };
+        let boxes = self.bvh_boxes(at, kind, &ray, sort);
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = if bvh_miss() {
-            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
-        } else {
-            self.bvh_triangle(at, kind, &ray)
-        };
+        let triangle = self.bvh_triangle(at, kind, &ray);
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
@@ -271,18 +283,55 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, zero));
         }
-        let results = self.end_guarded(gate, &results);
+        let mut results = self.end_guarded(gate, &results);
+        if let Some(e) = empty {
+            // A box node of an empty structure has no children; anything else
+            // is missed.
+            let c = self.cur;
+            let (k7, k6, k4) = (self.s.m.i32(7), self.s.m.i32(6), self.s.m.i32(4));
+            let kind = self.s.m.bin(c, Bin::And, pointer, k7);
+            let pair = self.s.m.bin(c, Bin::And, kind, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            for (k, r) in results.iter_mut().enumerate() {
+                let none = self.s.m.i32(bvh::NONE);
+                let miss = self.s.m.i32(bvh::MISS[k].to_bits());
+                let answer = self.s.m.select(c, is_box, none, miss);
+                *r = self.s.m.select(c, e, answer, *r);
+            }
+        }
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            self.write(inst, Reg::V(dst + k as u8), r, whole_guard);
         }
         Ok(())
+    }
+
+    /// (Fox T, `VICTORY_BVH_WALK=1`) This thread's node test counted in its dword of the
+    /// [`crate::emit::SLOT_WALK`] buffer: 1 for a box node, 0x10000 for a triangle.
+    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) {
+        let c = self.cur;
+        let (entry, i32t) = (self.s.entry, self.s.t.i32);
+        let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
+        let x = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+        let y = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
+        let (k12, k2) = (self.s.m.i32(12), self.s.m.i32(2));
+        let mask = self.s.m.i32(crate::emit::WALK_SLOTS - 1);
+        let row = self.s.m.bin(c, Bin::Shl, y, k12);
+        let at = self.s.m.bin(c, Bin::Add, x, row);
+        let at = self.s.m.bin(c, Bin::And, at, mask);
+        let byte = self.s.m.bin(c, Bin::Shl, at, k2);
+        let (one, high) = (self.s.m.i32(1), self.s.m.i32(0x10000));
+        let leaf = self.s.m.select(c, is_triangle, high, k0);
+        let add = self.s.m.select(c, is_box, one, leaf);
+        let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
+    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -299,11 +348,35 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at, inside);
+            return (handle, at, inside, slot);
         }
-        let (handle, byte) = self.memory(low, high, guard, false);
+        let (handle, slot, byte) = self.memory_parts(low, high, guard, false, true);
         let mapped = self.page_there.expect("memory says");
-        (handle, byte, mapped)
+        (handle.expect("asked for"), byte, mapped, slot)
+    }
+
+    /// (Fox T) [`Lower::bvh_memory`] without the view, for lanes that all run: the
+    /// (unused) view, the slot, the byte and whether the page is there.
+    fn bvh_memory_slot(&mut self, low: V, high: V) -> (Option<V>, V, V, V) {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            let (handle, byte, mapped, slot) = self.bvh_memory(low, high, None);
+            return (Some(handle), slot, byte, mapped);
+        }
+        let (_, slot, byte) = self.memory_parts(low, high, None, false, false);
+        let mapped = self.page_there.expect("memory says");
+        (None, slot, byte, mapped)
+    }
+
+    /// (Fox T) The view of title memory at heap slot `slot`, as [`Lower::bvh_memory`]
+    /// makes it.
+    fn bvh_view(&mut self, slot: V) -> V {
+        #[cfg(test)]
+        if TEST_MEMORY.get().is_some() {
+            let c = self.cur;
+            return self.s.heap_handle(c, slot, false, false, (11, 0));
+        }
+        self.memory_handle(slot)
     }
 
     /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
@@ -315,16 +388,43 @@ impl<'a> Lower<'a> {
                 let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 NodeAt::Buffer { handle, byte }
             }
-            NodeAt::Memory { low, high, .. } => {
+            NodeAt::Memory { low, high, .. } if !crate::emit::bvh_page_reuse() => {
                 let (low, high) = self.address_plus(low, high, 64);
                 // Every lane in this block runs the instruction.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
+                let (handle, byte, mapped, slot) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
                     mapped,
+                    slot,
+                }
+            }
+            NodeAt::Memory { byte: first, low: first_low, high: first_high, mapped: first_mapped, slot: first_slot, .. } => {
+                // (Fox T, `VICTORY_BVH_PAGE_REUSE`) The second half in the first one's
+                // page: its directory entry is the first half's; only a node that
+                // crosses into the next page looks that page up.
+                let c = self.cur;
+                let (k64k, last) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF - 64));
+                let within = self.s.m.bin(c, Bin::And, first_low, k64k);
+                let crosses = self.s.m.cmp(c, pred::IUGT, within, last);
+                let (low, high) = self.address_plus(first_low, first_high, 64);
+                let k64 = self.s.m.i32(64);
+                let same_byte = self.s.m.bin(c, Bin::Add, first, k64);
+                let gate = self.begin_guarded(Some(crosses));
+                let (_, slot, byte, mapped) = self.bvh_memory_slot(low, high);
+                let joined = self.end_guarded(gate, &[(slot, first_slot), (byte, same_byte), (mapped, first_mapped)]);
+                let (slot, byte, mapped) = (joined[0], joined[1], joined[2]);
+                let handle = self.bvh_view(slot);
+                PAGES_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                NodeAt::Memory {
+                    handle,
+                    byte,
+                    low,
+                    high,
+                    mapped,
+                    slot,
                 }
             }
         }

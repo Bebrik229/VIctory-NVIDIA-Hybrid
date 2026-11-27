@@ -417,6 +417,9 @@ pub(crate) struct Shadow {
     /// Lock-free mirror of `!pending.is_empty()` so read-only windows and
     /// buffers skip acquiring `pending` on refreshes and flight checks.
     has_pending: AtomicBool,
+    /// (Coder W, `VICTORY_CLEAN_STAMP`) The last range [`Shadow::nothing_new`] found clean,
+    /// with `crate::watch::block_seq_now` read before it looked: `(number, from, to)`; `0` = none.
+    clean: Mutex<(u64, usize, usize)>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -496,6 +499,9 @@ struct Card {
     /// Lock-free mirror of `!sent.is_empty()` so clean carded copies skip
     /// locking `sent` on every submission and landing.
     has_sent: AtomicBool,
+    /// (Coder W, `VICTORY_CARD_LISTS=1`; foxhound 441446d) The copy itself, set when it is noted
+    /// among [`CARDED`]: put on [`TOUCHED`] when `has_dirty` goes from clear to set.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -678,6 +684,34 @@ pub(crate) fn card_room_kept() -> u64 {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// (Coder W) `VICTORY_CARD_LISTS=1` (default off; from foxhound 441446d and 8c1fa5d): the copies
+/// in the card's memory whose CPU side changed are taken from a list made as they are touched,
+/// not found by a walk over all of them (~3,900) at every submission; and spread work wakes one
+/// helper thread per job beyond the caller's, not all of them. The same copies are sent, the
+/// same jobs run.
+fn card_lists() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_LISTS").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_CARD_LISTS`) The copies touched since [`card_dirty`] last took them.
+static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// `shadow`, just made with a card side, among [`CARDED`]; with the switch it knows itself, and
+/// one touched before that is on [`TOUCHED`] at once.
+fn carded(shadow: &Arc<Shadow>) {
+    let Some(card) = &shadow.card else {
+        return;
+    };
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+    if card_lists() {
+        let _ = card.me.set(Arc::downgrade(shadow));
+        if card.has_dirty.load(Ordering::Acquire) {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+        }
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -990,6 +1024,9 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    if card_lists() {
+        return card_dirty_listed(sent_as);
+    }
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -1022,6 +1059,52 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
+    out
+}
+
+/// [`card_dirty`] from [`TOUCHED`] (`VICTORY_CARD_LISTS`); [`CARDED`] is pruned of copies let go
+/// once it has doubled since it was last.
+fn card_dirty_listed(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        if carded.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
+            carded.retain(|weak| weak.strong_count() > 0);
+            KEPT.store(carded.len(), Ordering::Relaxed);
+        }
+    }
+    let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    touched.sort_unstable_by_key(|weak| weak.as_ptr() as usize);
+    touched.dedup_by(|a, b| a.ptr_eq(b));
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let relay_on = relay();
+    let mut out = Vec::new();
+    for weak in touched {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        if !c.has_dirty.load(Ordering::Acquire) {
+            continue;
+        }
+        let ranges = {
+            let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let ranges = joined(std::mem::take(&mut *dirty));
+            if relay_on {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, ranges.clone());
+                c.has_sent.store(!sent.is_empty(), Ordering::Release);
+            }
+            c.has_dirty.store(false, Ordering::Release);
+            ranges
+        };
+        if !ranges.is_empty() {
+            out.push((shadow, ranges));
+        }
+    }
     out
 }
 
@@ -1995,6 +2078,12 @@ fn workers() -> &'static Workers {
     workers
 }
 
+struct WideWait {
+    remaining: std::sync::atomic::AtomicUsize,
+    lock: Mutex<()>,
+    done: std::sync::Condvar,
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -2006,23 +2095,34 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let mut iter = jobs.into_iter();
+    let local = iter.next().expect("jobs len >= 2");
+    let rest_len = iter.len();
+    let left = Arc::new(WideWait {
+        remaining: std::sync::atomic::AtomicUsize::new(rest_len),
+        lock: Mutex::new(()),
+        done: std::sync::Condvar::new(),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for job in jobs {
+        workers.there.fetch_add(rest_len, Ordering::AcqRel);
+        for job in iter {
             let left = left.clone();
-            workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
                 job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
+                if left.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let _g = left.lock.lock().unwrap_or_else(|e| e.into_inner());
+                    left.done.notify_one();
                 }
             }));
         }
     }
-    workers.more.notify_all();
+    if rest_len < wide_threads() {
+        (0..rest_len).for_each(|_| workers.more.notify_one());
+    } else {
+        workers.more.notify_all();
+    }
+    local();
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -2033,10 +2133,12 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+    spin(|| left.remaining.load(Ordering::Acquire) == 0);
+    if left.remaining.load(Ordering::Acquire) > 0 {
+        let mut g = left.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while left.remaining.load(Ordering::Acquire) > 0 {
+            g = left.done.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 
@@ -2060,6 +2162,10 @@ pub(crate) fn wide_ranges(n: usize, grain: usize, work: impl Fn(std::ops::Range<
         return;
     }
     let grain = grain.max(1);
+    if n <= grain {
+        work(0..n);
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n.div_ceil(grain));
@@ -2690,6 +2796,18 @@ unsafe fn word_runs_avx2(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, us
     }
     runs
 }
+
+/// (C3, from another-victory-fork 6f3ede5) `VICTORY_UNDER_FUSED=1`, default
+/// off: [`Shadow::merge_under_writes`] puts the title's bytes into the CPU's
+/// side of a copy in the card's memory as it compares, a block of 32 bytes
+/// where one of its words differs.
+fn under_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_UNDER_FUSED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Pages compared and put in in one pass ([`under_fused`]) since the start.
+pub(crate) static MERGED_FUSED: AtomicU64 = AtomicU64::new(0);
 
 /// [`word_runs`], and every 32-byte block of `held` in which a word differs
 /// takes `title`'s bytes (the words of the tail that differ, one by one):
@@ -3549,6 +3667,11 @@ impl Shadow {
         watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
     }
 
+    /// (Coder W) Whether the copy is view memory guarded by us (not asked of the kernel ahead).
+    pub(crate) fn is_guarded(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == GUARDED
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -3612,6 +3735,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
+            clean: Mutex::new((0, 0, 0)),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3676,6 +3800,10 @@ impl Shadow {
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // (Coder W) Shaders may write it now: what was found clean is not known any more.
+        if crate::copystep::clean_stamp() != 0 {
+            *self.clean.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, 0);
+        }
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
@@ -4094,14 +4222,15 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy = joined(
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&(a, e)| a < to && e > from)
+                .map(|&(a, e)| (a.max(from), e.min(to)))
+                .collect(),
+        );
         if busy.is_empty() {
             return false;
         }
@@ -4141,14 +4270,15 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy = joined(
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&(a, e)| a < to && e > from)
+                .map(|&(a, e)| (a.max(from), e.min(to)))
+                .collect(),
+        );
         if busy.is_empty() {
             return false;
         }
@@ -4156,11 +4286,6 @@ impl Shadow {
             note_stale(0);
             return true;
         }
-        // The declared ranges overlap (views of the title's whole heap from
-        // dozens of offsets): as one range each page is asked about and
-        // compared once. Every byte of it is in a declared range, and of a
-        // copy in the PC's memory in the snapshot.
-        let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -4225,11 +4350,11 @@ impl Shadow {
             };
             // (Not on the threads of `wide`: the thread that waits there
             // takes whatever work comes, and a landing's takes the lock.)
-            const CHUNK: usize = 8;
+            let chunk = stale.len().div_ceil(4).clamp(1, 4);
             if stale.len() > 2 && under_wide() {
-                crate::land::each_under(stale.len().div_ceil(CHUNK), &|chunk| {
-                    let from = chunk * CHUNK;
-                    let to = (from + CHUNK).min(stale.len());
+                crate::land::each_under(stale.len().div_ceil(chunk), &|slot| {
+                    let from = slot * chunk;
+                    let to = (from + chunk).min(stale.len());
                     for i in from..to {
                         one(i);
                     }
@@ -4301,6 +4426,33 @@ impl Shadow {
             if self.card.is_some() {
                 // Whole words go up as pairs, all of them in one
                 // dispatch: only what is a copy of its own counts.
+                // (C3, [`under_fused`]) Compared and put in, in one pass,
+                // where the most copies of their own the page can have are
+                // left to take: taken first, what is not used given back.
+                let most = (n / 260 + 1) as i64;
+                let fused = crate::host::words_under()
+                    && under_fused()
+                    && crate::host::goes_as_words(0, 4)
+                    && !crate::host::upcheck::on()
+                    && at % 4 == 0
+                    && lo % 4 == 0
+                    && n % 4 == 0
+                    && {
+                        if left.fetch_sub(most, Ordering::Relaxed) >= most {
+                            true
+                        } else {
+                            left.fetch_add(most, Ordering::Relaxed);
+                            false
+                        }
+                    };
+                if fused {
+                    let runs = word_runs_put(lo, title, held);
+                    let own = |&&(r, m): &&(usize, usize)| !crate::host::goes_as_words(at + r, m);
+                    let copies = runs.iter().filter(own).count() as i64;
+                    left.fetch_add(most - copies.min(most), Ordering::Relaxed);
+                    MERGED_FUSED.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(runs));
+                }
                 let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
                 let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
                 let copies = runs.iter().filter(own).count() as i64;
@@ -4387,10 +4539,26 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        // (Coder W, `VICTORY_CLEAN_STAMP=1|verify`) Found clean before, and nothing it rests
+        // on changed since: clean, with no other lock, no walk.
+        let stamp = crate::copystep::clean_stamp();
+        let generation = if stamp != 0 { crate::watch::block_seq_now() } else { 0 };
+        let stamped = stamp != 0 && {
+            let c = *self.clean.lock().unwrap_or_else(|e| e.into_inner());
+            c.0 != 0 && c.1 <= from && to <= c.2 && crate::watch::blocks_unchanged_since(from, to, c.0)
+        };
+        if stamped && stamp == 1 {
+            crate::copystep::stamp_count(crate::copystep::S_HIT, 1);
+            return true;
+        }
+        let looked = (stamp != 0).then(std::time::Instant::now);
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.has_pending.load(Ordering::Acquire)
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
         {
+            if let Some(at) = looked {
+                crate::copystep::stamp_looked(stamped, false, at);
+            }
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4398,6 +4566,19 @@ impl Shadow {
         let base = start / PAGE;
         let same = (ranged != 0 || copied.range_all_copied(from / PAGE - base, (to - 1) / PAGE - base))
             && crate::watch::nothing_new(from, to, base, &copied.at, ranged);
+        drop(copied);
+        if let Some(at) = looked {
+            crate::copystep::stamp_looked(stamped, same, at);
+        }
+        // (Only an answer the blocks' bits gave: one the submission's asking gave can change
+        // with the asking, which no block number follows.)
+        if same && stamp != 0 && crate::watch::known_by_bits(from, to) {
+            let mut c = self.clean.lock().unwrap_or_else(|e| e.into_inner());
+            // (A wider range still clean is kept.)
+            if !(c.0 != 0 && c.1 <= from && to <= c.2 && crate::watch::blocks_unchanged_since(from, to, c.0)) {
+                *c = (generation, from, to);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4756,7 +4937,15 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.has_dirty.store(true, Ordering::Release);
+        if card_lists() {
+            if !card.has_dirty.swap(true, Ordering::AcqRel)
+                && let Some(me) = card.me.get()
+            {
+                TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+            }
+        } else {
+            card.has_dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -5068,6 +5257,7 @@ impl Shadow {
                 has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -5086,6 +5276,14 @@ impl Shadow {
         }
         let weak = Arc::downgrade(self);
         CARDED.lock().unwrap().push(weak.clone());
+        if card_lists()
+            && let Some(card) = &self.card
+        {
+            let _ = card.me.set(weak.clone());
+            if card.has_dirty.load(Ordering::Acquire) {
+                TOUCHED.lock().unwrap().push(weak.clone());
+            }
+        }
         Tracked(weak)
     }
 
@@ -5265,6 +5463,7 @@ mod land_tests {
             has_dirty: AtomicBool::new(false),
             sent: Mutex::default(),
             has_sent: AtomicBool::new(false),
+            me: std::sync::OnceLock::new(),
             size: len as u64,
         });
         Some(shadow)
@@ -5804,6 +6003,7 @@ fn copied_buffer(start: u64, len: u64, size: u64, buffer: ID3D12Resource, data: 
                 has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 size,
             };
             (on_card, Some(card))
@@ -5828,9 +6028,7 @@ fn copied_buffer(start: u64, len: u64, size: u64, buffer: ID3D12Resource, data: 
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-    }
+    carded(&shadow);
     shadow
 }
 
@@ -6034,10 +6232,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         has_dirty: AtomicBool::new(false),
         sent: Mutex::default(),
         has_sent: AtomicBool::new(false),
+        me: std::sync::OnceLock::new(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    carded(&shadow);
     Some(shadow)
 }
 
@@ -6124,6 +6323,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
                 has_sent: AtomicBool::new(false),
+                me: std::sync::OnceLock::new(),
                 size: len,
             };
             (on_card, Some(card))
@@ -6141,9 +6341,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-    }
+    carded(&shadow);
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
@@ -6995,6 +7193,130 @@ mod copied_and_take_tests {
             assert_eq!(held_avx2, title);
 
             eprintln!("64 MiB Shadow::take diff: scalar {scalar_ms:.2} ms | AVX2 word_runs_put {avx2_ms:.2} ms");
+        }
+    }
+}
+
+#[cfg(test)]
+mod clean_stamp_tests {
+    use super::*;
+
+    #[test]
+    fn clean_stamp_caches_published_range_and_invalidates_on_changes() {
+        const CHILD: &str = "VICTORY_TEST_CLEAN_STAMP_MODE";
+        if let Ok(expected_mode) = std::env::var(CHILD) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+                UnmapViewOfFile,
+            };
+
+            let expected: u8 = expected_mode.parse().unwrap();
+            assert_eq!(crate::copystep::clean_stamp(), expected);
+
+            // SAFETY: fresh 2-block pagefile section mapped read-write for this test.
+            let (section, view) = unsafe {
+                let section = CreateFileMappingW(
+                    -1isize as _,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    (2 * PAGE) as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize;
+                (section, view)
+            };
+            assert_ne!(view, 0);
+
+            let mut staging = vec![0u8; 2 * PAGE];
+            let copy = Shadow::unbacked(view as u64, staging.as_mut_ptr(), (2 * PAGE) as u64, true);
+
+            // Initial update guards the mapped view, copies bytes, and publishes both blocks.
+            assert_eq!(copy.update(view, 2 * PAGE), 2 * PAGE);
+            assert!(crate::watch::known_by_bits(view, view + 2 * PAGE));
+
+            // First `nothing_new` checks bits + journal and stamps `clean` when enabled.
+            assert!(copy.nothing_new(view, 2 * PAGE));
+            let first = *copy.clean.lock().unwrap_or_else(|e| e.into_inner());
+            if expected == 0 {
+                assert_eq!(first, (0, 0, 0));
+            } else {
+                assert_ne!(first.0, 0);
+                assert_eq!((first.1, first.2), (view, view + 2 * PAGE));
+            }
+
+            // Subrange check stays clean and keeps the wider cached stamp.
+            assert!(copy.nothing_new(view + 128, PAGE));
+            assert_eq!(*copy.clean.lock().unwrap_or_else(|e| e.into_inner()), first);
+
+            // Opening block 0 for a title write bumps block 0 only.
+            crate::watch::opened_for_writing(view);
+            // SAFETY: block 0 was opened for writing above and lies inside our mapped view.
+            unsafe { (view as *mut u8).write_volatile(0x5A) };
+            if expected != 0 {
+                assert!(!crate::watch::blocks_unchanged_since(view, view + PAGE, first.0));
+                assert!(crate::watch::blocks_unchanged_since(view + PAGE, view + 2 * PAGE, first.0));
+            }
+            assert!(!copy.nothing_new(view, PAGE));
+            assert!(copy.nothing_new(view + PAGE, PAGE));
+
+            // Re-refreshing block 0 re-publishes it; checking the full range advances the stamp.
+            assert_eq!(copy.update(view, PAGE), PAGE);
+            assert_eq!(staging[0], 0x5A);
+            assert!(copy.nothing_new(view, 2 * PAGE));
+            let second = *copy.clean.lock().unwrap_or_else(|e| e.into_inner());
+            if expected == 0 {
+                assert_eq!(second, (0, 0, 0));
+            } else {
+                assert!(second.0 > first.0);
+                assert_eq!((second.1, second.2), (view, view + 2 * PAGE));
+            }
+
+            // Declaring a shader write invalidates the cached clean stamp.
+            copy.writing(view, 4096);
+            assert_eq!(*copy.clean.lock().unwrap_or_else(|e| e.into_inner()), (0, 0, 0));
+            assert!(!copy.nothing_new(view, PAGE));
+
+            crate::watch::title_memory_unmapping(view, 2 * PAGE);
+            // SAFETY: our mapped view and section handle, no longer referenced.
+            unsafe {
+                assert_ne!(
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    }),
+                    0
+                );
+                assert_ne!(CloseHandle(section), 0);
+            }
+            return;
+        }
+
+        for (env_val, expected_mode) in [
+            (None, "1"),
+            (Some("1"), "1"),
+            (Some("verify"), "2"),
+            (Some("0"), "0"),
+        ] {
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "shadow::clean_stamp_tests::clean_stamp_caches_published_range_and_invalidates_on_changes",
+            ])
+            .env(CHILD, expected_mode);
+            if let Some(v) = env_val {
+                cmd.env("VICTORY_CLEAN_STAMP", v);
+            } else {
+                cmd.env_remove("VICTORY_CLEAN_STAMP");
+            }
+            let run = cmd.output().unwrap();
+            assert!(
+                run.status.success(),
+                "VICTORY_CLEAN_STAMP={env_val:?} (expected {expected_mode}): stdout={}\nstderr={}",
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
         }
     }
 }

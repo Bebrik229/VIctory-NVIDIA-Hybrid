@@ -273,6 +273,9 @@ impl Shader {
 }
 
 #[cfg(windows)]
+mod motion_blur;
+
+#[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
@@ -282,7 +285,15 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = match motion_blur::neutral_pass(container, &c, &programs) {
+        Some(Ok(host)) => host,
+        attempt => {
+            if let Some(Err(error)) = attempt {
+                tracing::warn!(%error, "camera motion blur override failed; using the original pass");
+            }
+            crate::shader_cache::host_shader(container)?
+        }
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let image_stores = programs.is_empty() || programs.iter().any(image_stores);
     let threads = programs.iter().find_map(|p| match &p.io {
@@ -300,7 +311,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, host.table_reads.as_deref());
     Ok(Translated {
         host,
         threads,
@@ -537,6 +548,16 @@ pub(crate) fn bound(this: This) {
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
+}
+
+/// (Fox T, diagnostics) The name the pipeline diagnostics (`VICTORY_E5_METER`,
+/// alias logs) identify the title pipeline `this` by.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn label(this: This) -> Arc<str> {
+    if this.is_null() {
+        return Arc::from("no pipeline");
+    }
+    Arc::from(make::hashes(&pipeline(this).host))
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
@@ -871,7 +892,7 @@ pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
-mod library;
+pub(crate) mod library;
 #[cfg(windows)]
 mod make;
 

@@ -532,9 +532,11 @@ pub(crate) fn sync_heaps() {
         spent[1] += since(began);
         let began = std::time::Instant::now();
         crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+            let mut batch = host::SyncBatch::default();
             for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+                host.mirror_sync(index, start + u64::from(index) * step, &mut batch);
             }
+            host.finish_sync(batch);
         });
         spent[2] += since(began);
         if !wait.is_empty() {

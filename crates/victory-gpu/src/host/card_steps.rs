@@ -483,7 +483,7 @@ struct RecordedStep {
 
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<RecordedStep>) {
+fn does_of(written: &[(usize, usize)], runs: &[&HostList], clone_fills: bool) -> (Vec<Does>, Vec<RecordedStep>) {
     let mut does = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
@@ -500,7 +500,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<Re
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
                 Step::Fill(_, src, len, to) => {
-                    fill = to.clone();
+                    if clone_fills {
+                        fill = to.clone();
+                    }
                     Does::Fill {
                         src: *src,
                         len: *len,
@@ -552,7 +554,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (does, steps) = does_of(&written, runs, false);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) == Err(BEHIND_PLACED)
         && let Some((placed, reader)) = behind
@@ -801,7 +803,7 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, mut steps) = does_of(written, runs);
+        let (does, mut steps) = does_of(written, runs, true);
         let by_order = placed_order();
         let chosen = plan(&does, stage(), by_order, &mut None);
         if does.iter().any(|d| matches!(d, Does::Placed { .. })) {

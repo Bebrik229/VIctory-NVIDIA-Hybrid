@@ -21,6 +21,9 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(windows)]
+pub(super) mod pc;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -141,8 +144,8 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    /// Keyboard reading and the stand-in gamepad from the same poll.
+    fn keyboard(&mut self) -> (Vec<KeyState>, PadState);
     /// Smooth analog mouse-look overlay merged into the keyboard stand-in pad.
     fn mouse_pad(&mut self) -> PadState {
         PadState::default()
@@ -509,6 +512,457 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+/// `VICTORY_AUTO_A=<seconds>` (from Neptune): for that long after the start,
+/// Enter (the stand-in pad's A) is down for a quarter of a second in every
+/// four, whether or not the window has focus, so an unattended launch gets
+/// through the title's "press A" screens. 0 (the default) is off.
+static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
+    let seconds = std::env::var("VICTORY_AUTO_A")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if seconds > 0 {
+        LazyLock::force(&START);
+        tracing::info!("auto A: pressing A for the first {seconds} s");
+    }
+    seconds
+});
+
+/// Whether the auto press holds A `elapsed` after the start.
+fn auto_a_pressed(elapsed: Duration, seconds: u64) -> bool {
+    elapsed.as_secs() < seconds && elapsed.as_millis() % 4000 < 250
+}
+
+/// How long a scripted tap holds its button.
+const TAP_MS: u64 = 100;
+
+/// How long a screen condition must hold before its wait ends.
+const HOLD_MS: u64 = 500;
+
+/// How long a wait on the screen may take before the script gives up.
+const GIVE_UP_MS: u64 = 180_000;
+
+/// A button by its pad name or its stand-in key's name.
+fn button_named(name: &str) -> Option<u32> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "a" | "enter" => A,
+        "b" | "backspace" => B,
+        "x" => X,
+        "y" => Y,
+        "up" | "arrowup" => UP,
+        "down" | "arrowdown" => DOWN,
+        "left" | "arrowleft" => LEFT,
+        "right" | "arrowright" => RIGHT,
+        "start" | "menu" | "esc" | "escape" => MENU,
+        "back" | "view" | "tab" => VIEW,
+        "lb" => LEFT_SHOULDER,
+        "rb" => RIGHT_SHOULDER,
+        _ => return None,
+    })
+}
+
+/// Seconds as milliseconds; `None` unless finite and not negative.
+fn millis(seconds: &str) -> Option<u64> {
+    seconds
+        .parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| (s * 1000.0).round() as u64)
+}
+
+/// A condition on the most recent presented frame's draw count:
+/// `d>=N`, `d>N`, `d<=N`, `d<N`.
+#[derive(Clone, Debug, PartialEq)]
+struct Cond {
+    text: String,
+    op: Op,
+    n: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Op {
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+impl Cond {
+    fn parse(text: &str) -> Option<Cond> {
+        let rest = text.strip_prefix(['d', 'D'])?;
+        let (op, n) = if let Some(n) = rest.strip_prefix(">=") {
+            (Op::Ge, n)
+        } else if let Some(n) = rest.strip_prefix("<=") {
+            (Op::Le, n)
+        } else if let Some(n) = rest.strip_prefix('>') {
+            (Op::Gt, n)
+        } else if let Some(n) = rest.strip_prefix('<') {
+            (Op::Lt, n)
+        } else {
+            return None;
+        };
+        let n = n.trim().parse().ok()?;
+        Some(Cond {
+            text: text.to_owned(),
+            op,
+            n,
+        })
+    }
+
+    fn holds(&self, draws: u32) -> bool {
+        match self.op {
+            Op::Ge => draws >= self.n,
+            Op::Gt => draws > self.n,
+            Op::Le => draws <= self.n,
+            Op::Lt => draws < self.n,
+        }
+    }
+}
+
+/// One step of a `VICTORY_AUTO_INPUT` script.
+#[derive(Clone, Debug, PartialEq)]
+enum Step {
+    /// `@<seconds>`: until that long after the start (a no-op once past).
+    At(u64),
+    /// `w<seconds>`.
+    Wait(u64),
+    /// A button tapped for `TAP_MS`.
+    Tap(u32),
+    /// `d>=N` and the like: until the condition has held for `HOLD_MS`.
+    Until(Cond),
+    /// `rep(<button>,<seconds>,<cond>)`: the button tapped every period until
+    /// the condition holds (looked at before each tap), then held for `HOLD_MS`.
+    Repeat(u32, u64, Cond),
+}
+
+/// Splits at commas outside parentheses.
+fn split_steps(script: &str) -> Vec<&str> {
+    let (mut steps, mut depth, mut from) = (Vec::new(), 0i32, 0);
+    for (i, c) in script.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth <= 0 => {
+                steps.push(&script[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    steps.push(&script[from..]);
+    steps
+}
+
+/// `VICTORY_AUTO_INPUT` as steps: a button name (tapped for `TAP_MS`), a wait
+/// `w<seconds>`, `@<seconds>` (until that long after the process start, a
+/// no-op once past), a wait on the screen `d>=N` / `d<N` (the most recent
+/// presented frame's draw count satisfies it for 500 ms), or
+/// `rep(<button>,<seconds>,<cond>)` (the button tapped every period until
+/// the condition holds). Buttons and waits take an optional repeat `x<n>`
+/// (`Downx3`, `w1x2`). Steps that do not parse are skipped and returned.
+fn parse_script(script: &str) -> (Vec<Step>, Vec<String>) {
+    let mut steps = Vec::new();
+    let mut bad = Vec::new();
+    for step in split_steps(script)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(seconds) = step.strip_prefix('@') {
+            match millis(seconds) {
+                Some(ms) => steps.push(Step::At(ms)),
+                None => bad.push(step.to_owned()),
+            }
+            continue;
+        }
+        if let Some(cond) = Cond::parse(step) {
+            steps.push(Step::Until(cond));
+            continue;
+        }
+        if let Some(inner) = step.strip_prefix("rep(").and_then(|s| s.strip_suffix(')')) {
+            let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+            match parts.as_slice() {
+                [button, seconds, cond] => {
+                    match (button_named(button), millis(seconds), Cond::parse(cond)) {
+                        (Some(b), Some(ms), Some(c)) if ms > 0 => {
+                            steps.push(Step::Repeat(b, ms, c))
+                        }
+                        _ => bad.push(step.to_owned()),
+                    }
+                }
+                _ => bad.push(step.to_owned()),
+            }
+            continue;
+        }
+        let (body, times) = match step.rsplit_once(['x', 'X']) {
+            Some((body, n))
+                if !body.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                match n.parse::<u32>() {
+                    Ok(n) => (body, n),
+                    Err(_) => {
+                        bad.push(step.to_owned());
+                        continue;
+                    }
+                }
+            }
+            _ => (step, 1),
+        };
+        let wait = body.strip_prefix(['w', 'W']).and_then(millis);
+        match (wait, button_named(body)) {
+            (Some(ms), _) => steps.extend((0..times).map(|_| Step::Wait(ms))),
+            (None, Some(buttons)) => steps.extend((0..times).map(|_| Step::Tap(buttons))),
+            (None, None) => bad.push(step.to_owned()),
+        }
+    }
+    (steps, bad)
+}
+
+/// Where the script is within its current step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Fresh,
+    /// A tap held over `from..from + TAP_MS`.
+    Tapping { from: u64 },
+    /// A wait on the screen: begun at `started`, the condition holding since `since`.
+    Waiting { started: u64, since: Option<u64> },
+    /// A repeat: begun at `started`, the next tap due at `next`, the last held
+    /// until `until`, the condition holding since `since`.
+    Repeating {
+        started: u64,
+        next: u64,
+        until: u64,
+        since: Option<u64>,
+    },
+}
+
+/// A `VICTORY_AUTO_INPUT` script run against the clock and the screen:
+/// advanced at each input poll with the milliseconds since the start and
+/// the draw count of the most recent presented frame, it says which
+/// buttons are held (the same call twice gives the same answer). Taps not
+/// placed by an `@` or a wait on the screen come `gap` ms after the tap
+/// before them; timed steps count from where the step before ended, as
+/// planned, not from when the poll came.
+struct Script {
+    steps: Vec<Step>,
+    gap: u64,
+    i: usize,
+    /// When the current step begins.
+    at: u64,
+    /// A tap came last, with no `@` or screen wait since.
+    after_tap: bool,
+    phase: Phase,
+    /// Given up: no more presses.
+    stopped: bool,
+    /// What the steps said (waits done, giving up), for the log: (warning, text).
+    said: Vec<(bool, String)>,
+    /// Taps begun: when and which buttons.
+    tapped: Vec<(u64, u32)>,
+}
+
+impl Script {
+    fn new(steps: Vec<Step>, start: u64, gap: u64) -> Script {
+        Script {
+            steps,
+            gap,
+            i: 0,
+            at: start,
+            after_tap: false,
+            phase: Phase::Fresh,
+            stopped: false,
+            said: Vec::new(),
+            tapped: Vec::new(),
+        }
+    }
+
+    fn next(&mut self, at: u64) {
+        self.i += 1;
+        self.at = at;
+        self.phase = Phase::Fresh;
+    }
+
+    /// The buttons held at `now` ms with `draws` on the screen.
+    fn advance(&mut self, now: u64, draws: u32) -> u32 {
+        while !self.stopped && self.i < self.steps.len() {
+            match self.steps[self.i].clone() {
+                Step::At(ms) => {
+                    self.after_tap = false;
+                    let at = self.at.max(ms);
+                    self.next(at);
+                }
+                Step::Wait(ms) => {
+                    let at = self.at + ms;
+                    self.next(at);
+                }
+                Step::Tap(buttons) => {
+                    let from = match self.phase {
+                        Phase::Tapping { from } => from,
+                        _ => {
+                            let from = self.at + if self.after_tap { self.gap } else { 0 };
+                            self.phase = Phase::Tapping { from };
+                            self.tapped.push((from, buttons));
+                            from
+                        }
+                    };
+                    if now < from {
+                        return 0;
+                    }
+                    if now < from + TAP_MS {
+                        return buttons;
+                    }
+                    self.after_tap = true;
+                    self.next(from + TAP_MS);
+                }
+                Step::Until(cond) => {
+                    if now < self.at {
+                        return 0;
+                    }
+                    let (started, since) = match self.phase {
+                        Phase::Waiting { started, since } => (started, since),
+                        _ => (now, None),
+                    };
+                    let since = cond.holds(draws).then(|| since.unwrap_or(now));
+                    if since.is_some_and(|s| now - s >= HOLD_MS) {
+                        self.said.push((
+                            false,
+                            format!("{} after {:.1} s", cond.text, (now - started) as f64 / 1e3),
+                        ));
+                        self.after_tap = false;
+                        self.next(now);
+                        continue;
+                    }
+                    if now - started >= GIVE_UP_MS {
+                        self.give_up(&cond.text);
+                        return 0;
+                    }
+                    self.phase = Phase::Waiting { started, since };
+                    return 0;
+                }
+                Step::Repeat(buttons, period, cond) => {
+                    if now < self.at {
+                        return 0;
+                    }
+                    let (started, next, until, since) = match self.phase {
+                        Phase::Repeating {
+                            started,
+                            next,
+                            until,
+                            since,
+                        } => (started, next, until, since),
+                        _ => (now, now, 0, None),
+                    };
+                    if now < until {
+                        // A tap under way is held to its end.
+                        return buttons;
+                    }
+                    // Looked at before each tap: none lands once the screen changed.
+                    let since = cond.holds(draws).then(|| since.unwrap_or(now));
+                    if since.is_some_and(|s| now - s >= HOLD_MS) {
+                        self.said.push((
+                            false,
+                            format!(
+                                "rep until {} after {:.1} s",
+                                cond.text,
+                                (now - started) as f64 / 1e3
+                            ),
+                        ));
+                        self.after_tap = false;
+                        self.next(now);
+                        continue;
+                    }
+                    if now - started >= GIVE_UP_MS {
+                        self.give_up(&cond.text);
+                        return 0;
+                    }
+                    if since.is_none() && now >= next {
+                        self.tapped.push((now, buttons));
+                        self.phase = Phase::Repeating {
+                            started,
+                            next: now + period,
+                            until: now + TAP_MS,
+                            since,
+                        };
+                        return buttons;
+                    }
+                    self.phase = Phase::Repeating {
+                        started,
+                        next,
+                        until,
+                        since,
+                    };
+                    return 0;
+                }
+            }
+        }
+        0
+    }
+
+    fn give_up(&mut self, cond: &str) {
+        self.stopped = true;
+        self.said.push((true, format!("gave up waiting for {cond}")));
+    }
+}
+
+/// `VICTORY_AUTO_INPUT`, `VICTORY_AUTO_INPUT_START_S` (default 0),
+/// `VICTORY_AUTO_INPUT_GAP_MS` (default 400), parsed once.
+static AUTO_INPUT: LazyLock<Option<Mutex<Script>>> = LazyLock::new(|| {
+    let script = std::env::var("VICTORY_AUTO_INPUT").ok()?;
+    let number = |name: &str, default: f64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(default)
+    };
+    let start_s = number("VICTORY_AUTO_INPUT_START_S", 0.0);
+    let gap = number("VICTORY_AUTO_INPUT_GAP_MS", 400.0).round() as u64;
+    let (steps, bad) = parse_script(&script);
+    for step in bad {
+        tracing::warn!("auto input: ignoring step {step:?}");
+    }
+    LazyLock::force(&START);
+    tracing::info!("auto input: {} steps, starting at {start_s} s", steps.len());
+    for (i, step) in steps.iter().enumerate() {
+        tracing::debug!(step = i, ?step, "auto input step");
+    }
+    Some(Mutex::new(Script::new(
+        steps,
+        (start_s * 1000.0).round() as u64,
+        gap,
+    )))
+});
+
+/// The scripted buttons held now; what the script has to say is logged.
+fn scripted_now(elapsed_ms: u64) -> u32 {
+    let Some(script) = AUTO_INPUT.as_ref() else {
+        return 0;
+    };
+    let draws = 0;
+    let mut script = lock(script);
+    let buttons = script.advance(elapsed_ms, draws);
+    script.tapped.clear();
+    for (warn, line) in std::mem::take(&mut script.said) {
+        if warn {
+            tracing::warn!("auto input: {line}");
+        } else {
+            tracing::info!("auto input: {line}");
+        }
+    }
+    buttons
+}
+
+/// Pad buttons the auto inputs hold now (`VICTORY_AUTO_A`, `VICTORY_AUTO_INPUT`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn auto_buttons() -> u32 {
+    let elapsed = START.elapsed();
+    let a = if *AUTO_A > 0 && auto_a_pressed(elapsed, *AUTO_A) {
+        A
+    } else {
+        0
+    };
+    a | scripted_now(elapsed.as_millis() as u64)
+}
+
 /// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
@@ -561,14 +1015,18 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, mouse) = {
+        let (pads, (keys, stand_in), mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            let keys = source.keys();
-            let mouse = source.mouse_pad();
-            (pads, keys, mouse)
+            (pads, source.keyboard(), source.mouse_pad())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
+        let events = self.state().poll(
+            &self.devices,
+            self.one_pad,
+            pads,
+            keys,
+            merge_pad(stand_in, mouse),
+        );
         self.deliver(events);
     }
 
@@ -614,13 +1072,12 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        mouse: PadState,
+        stand_in: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let base = merge_pad(fallback(&keys), mouse);
-            let pad = pads.into_iter().flatten().fold(base, merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -629,7 +1086,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(merge_pad(fallback(&keys), mouse)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -693,8 +1150,8 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
+        fn keyboard(&mut self) -> (Vec<KeyState>, PadState) {
+            (Vec::new(), PadState::default())
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
@@ -1255,6 +1712,7 @@ mod host {
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1273,13 +1731,6 @@ mod host {
     };
 
     use super::*;
-
-    // `ClientToScreen` is exported by `user32.dll` (already linked via `windows-sys`)
-    // under the `Win32_Graphics_Gdi` feature, which `victory-hle` does not enable.
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn ClientToScreen(hwnd: HWND, lppoint: *mut POINT) -> i32;
-    }
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
@@ -1577,6 +2028,7 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         mouse: MouseLook,
+        pc_layout: pc::Layout,
     }
 
     impl Default for Host {
@@ -1584,12 +2036,16 @@ mod host {
             Self {
                 empty_until: Default::default(),
                 mouse: MouseLook::from_env(),
+                pc_layout: pc::Layout::default(),
             }
         }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if pc::bench_script() {
+                return None;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1613,35 +2069,80 @@ mod host {
                     }
                 }
             }
+            // The auto press likewise reaches a real first pad, which hides
+            // the stand-in.
+            if slot == 0 {
+                pad.buttons |= super::auto_buttons();
+            }
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
-            let mut down = scripted();
-            if focused() {
+        fn keyboard(&mut self) -> (Vec<KeyState>, PadState) {
+            let key_state = |vk: u8| KeyState {
+                // SAFETY: plain query.
+                scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                virtual_key: vk,
+                // shortcut: no characters (code point 0);
+                // the title reads scan codes and virtual keys only.
+                ..Default::default()
+            };
+            // SAFETY: GetAsyncKeyState only queries the specified virtual key.
+            let pressed = |vk: u8| unsafe { GetAsyncKeyState(i32::from(vk)) < 0 };
+            let active = !pc::bench_script() && focused();
+            let held: Vec<KeyState> = if active {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
+                (0x08..=0xfe)
+                    .filter(|vk| !(0x10..=0x12).contains(vk) && pressed(*vk))
+                    .map(key_state)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Script commands use the fork's original bindings regardless of the manual layout.
+            let mut keys: Vec<_> = scripted().into_iter().map(key_state).collect();
+            let mouse = if !pc::bench_script() {
+                self.mouse.poll()
+            } else {
+                PadState::default()
+            };
+            let mut manual_pad = if pc::enabled() && active {
+                let mut pad = self.pc_layout.read_host(&held, pressed(1), pressed(2));
+                if pressed(4) {
+                    pad.buttons |= RIGHT_STICK;
+                }
+                pad.buttons |= mouse.buttons;
+                if pad.right_x == 0.0 && pad.right_y == 0.0 {
+                    pad.right_x = mouse.right_x;
+                    pad.right_y = mouse.right_y;
+                }
+                Some(merged(pad, fallback(&keys)))
+            } else {
+                if pc::enabled() {
+                    pc::clear_motion();
+                    self.pc_layout.suspend();
+                }
+                None
+            };
+            for key in held {
+                if pc::enabled() && key.virtual_key == 0x75 {
+                    continue;
+                }
+                if !keys.iter().any(|k| k.virtual_key == key.virtual_key) {
+                    keys.push(key);
+                }
             }
-            down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
-        }
-
-        fn mouse_pad(&mut self) -> PadState {
-            self.mouse.poll()
+            let auto = super::auto_buttons();
+            for &(vk, button) in &super::FALLBACK_BUTTONS {
+                if auto & button != 0 && !keys.iter().any(|k| k.virtual_key == vk) {
+                    keys.push(key_state(vk));
+                }
+            }
+            if let Some(pad) = &mut manual_pad {
+                pad.buttons |= auto;
+            }
+            let stand_in = manual_pad.unwrap_or_else(|| merge_pad(fallback(&keys), mouse));
+            (keys, stand_in)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1798,8 +2299,10 @@ mod tests {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
-            self.0.lock().unwrap().keys.clone()
+        fn keyboard(&mut self) -> (Vec<KeyState>, PadState) {
+            let keys = self.0.lock().unwrap().keys.clone();
+            let pad = fallback(&keys);
+            (keys, pad)
         }
         fn mouse_pad(&mut self) -> PadState {
             self.0.lock().unwrap().mouse
@@ -2311,12 +2814,249 @@ mod tests {
             fn pad(&mut self, _: usize) -> Option<PadState> {
                 None
             }
-            fn keys(&mut self) -> Vec<KeyState> {
-                Vec::new()
+            fn keyboard(&mut self) -> (Vec<KeyState>, PadState) {
+                (Vec::new(), PadState::default())
             }
             fn rumble(&mut self, _: usize, _: u16, _: u16) {}
         }
         assert_eq!(Minimal.mouse_pad(), PadState::default());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bedroom_prompt_and_walk_use_the_same_gameinput_readings_as_xinput() {
+        use windows_sys::Win32::UI::Input::XboxController::{
+            XINPUT_GAMEPAD, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        };
+
+        #[derive(Default)]
+        struct Keyboard {
+            pressed: Arc<Mutex<Vec<KeyState>>>,
+            layout: pc::Layout,
+        }
+        impl Source for Keyboard {
+            fn pad(&mut self, _: usize) -> Option<PadState> {
+                None
+            }
+            fn keyboard(&mut self) -> (Vec<KeyState>, PadState) {
+                let keys = lock(&self.pressed).clone();
+                let state = self.layout.read(&keys, false, false);
+                (keys, state)
+            }
+            fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        }
+        let keyboard = Keyboard::default();
+        let held = keyboard.pressed.clone();
+        let hub = Hub::new(Box::new(keyboard), true);
+        for (keys, buttons, y) in [
+            (&[b'F'][..], XINPUT_GAMEPAD_Y, 0),
+            (&[b'W'], 0, i16::MAX),
+            (&[b'S'], 0, i16::MIN),
+            (&[b'Y'], XINPUT_GAMEPAD_Y, 0),
+            (&[b'Y'], XINPUT_GAMEPAD_Y, 0),
+            (&[], 0, 0),
+            (&[b'X'], XINPUT_GAMEPAD_X, 0),
+            (&[], 0, 0),
+        ] {
+            *lock(&held) = keys.iter().copied().map(key).collect();
+            hub.poll();
+            let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            assert_eq!(
+                pad(r),
+                host::convert(&XINPUT_GAMEPAD {
+                    wButtons: buttons,
+                    sThumbLY: y,
+                    ..Default::default()
+                })
+            );
+            release(r);
+        }
+    }
+
+    #[test]
+    fn auto_a_holds_a_quarter_second_in_every_four() {
+        let at = |ms| auto_a_pressed(Duration::from_millis(ms), 10);
+        assert!(at(0) && at(249) && at(4000) && at(8249));
+        assert!(!at(250) && !at(3999) && !at(4250));
+        // Off after the window, and when the switch is 0.
+        assert!(!at(12_000) && !at(10_000));
+        assert!(!auto_a_pressed(Duration::ZERO, 0));
+    }
+
+    /// Runs a script over `until` ms in 10 ms polls with `draws(ms)` on the
+    /// screen: the taps begun (when, buttons), the buttons held at each poll,
+    /// and what it said.
+    fn run(
+        script: &str,
+        start: u64,
+        gap: u64,
+        until: u64,
+        draws: impl Fn(u64) -> u32,
+    ) -> (Script, Vec<u32>) {
+        let (steps, bad) = parse_script(script);
+        assert!(bad.is_empty(), "{bad:?}");
+        let mut s = Script::new(steps, start, gap);
+        let held = (0..=until / 10)
+            .map(|i| s.advance(i * 10, draws(i * 10)))
+            .collect();
+        (s, held)
+    }
+
+    /// The taps of a timed script, without running it to the end.
+    fn taps(script: &str, start: u64, gap: u64) -> Vec<(u64, u32)> {
+        run(script, start, gap, 120_000, |_| 0).0.tapped
+    }
+
+    #[test]
+    fn auto_input_script_taps_waits_and_repeats() {
+        // Start 1 s, gap 400: A at 1000, wait 3 s, Down x3 from 4500.
+        let (s, held) = run("A, w3, Downx3, w0.5, lb", 1000, 400, 100_000, |_| 0);
+        let froms: Vec<u64> = s.tapped.iter().map(|t| t.0).collect();
+        assert_eq!(froms, [1000, 4500, 5000, 5500, 6500]);
+        let at = |ms: usize| held[ms / 10];
+        assert_eq!((at(990), at(1000), at(1090), at(1100)), (0, A, A, 0));
+        assert_eq!(
+            (at(4500), at(5050), at(5550), at(5600)),
+            (DOWN, DOWN, DOWN, 0)
+        );
+        assert_eq!(at(6550), LEFT_SHOULDER);
+        assert_eq!(at(100_000), 0);
+    }
+
+    #[test]
+    fn auto_input_skips_malformed_steps() {
+        let (steps, bad) =
+            parse_script("Jump,A,wx,w-1,Downx,,@x,@-2,Startx2,rep(A,0,d>1),rep(Q,1,d>1),d=3");
+        assert_eq!(
+            bad,
+            [
+                "Jump",
+                "wx",
+                "w-1",
+                "Downx",
+                "@x",
+                "@-2",
+                "rep(A,0,d>1)",
+                "rep(Q,1,d>1)",
+                "d=3"
+            ]
+        );
+        assert_eq!(steps, [Step::Tap(A), Step::Tap(MENU), Step::Tap(MENU)]);
+        let t = taps("A,Startx2", 0, 0);
+        assert_eq!(t.iter().map(|t| t.1).collect::<Vec<_>>(), [A, MENU, MENU]);
+        assert_eq!(t[2].0, 2 * TAP_MS);
+    }
+
+    #[test]
+    fn auto_input_replays_the_recorded_start() {
+        let script = "@7.6,A,@8.9,A,@9.1,A,@9.3,A,@9.5,A,@24,A,@24.4,A,@24.9,A,@26.1,A,@27.3,A,@28.5,Down,@29.4,Down,@34,Down,@34.35,A,@35.65,A,@36.2,Down,@36.55,A,@36.9,Down,@37.35,A";
+        // The start offset does not move `@` times; the gap does not apply.
+        let (s, held) = run(script, 0, 400, 40_000, |_| 0);
+        let expected = [
+            (7600, A),
+            (8900, A),
+            (9100, A),
+            (9300, A),
+            (9500, A),
+            (24000, A),
+            (24400, A),
+            (24900, A),
+            (26100, A),
+            (27300, A),
+            (28500, DOWN),
+            (29400, DOWN),
+            (34000, DOWN),
+            (34350, A),
+            (35650, A),
+            (36200, DOWN),
+            (36550, A),
+            (36900, DOWN),
+            (37350, A),
+        ];
+        assert_eq!(s.tapped, expected);
+        assert_eq!(held[34_400 / 10], A);
+        assert_eq!(held[34_460 / 10], 0);
+        // Aliases and an `@` already past.
+        assert_eq!(taps("Enter,@0,ArrowDown", 0, 400), [(0, A), (100, DOWN)]);
+    }
+
+    #[test]
+    fn auto_input_parses_the_screen_script() {
+        let (steps, bad) = parse_script(
+            "@7,rep(A,1.5,d>=20),w0.8,Down,Down,d>=40,w0.8,Down,A,w1.2,A,Down,A,Down,A",
+        );
+        assert!(bad.is_empty(), "{bad:?}");
+        let ge = |n| Cond {
+            text: format!("d>={n}"),
+            op: Op::Ge,
+            n,
+        };
+        assert_eq!(
+            steps,
+            [
+                Step::At(7000),
+                Step::Repeat(A, 1500, ge(20)),
+                Step::Wait(800),
+                Step::Tap(DOWN),
+                Step::Tap(DOWN),
+                Step::Until(ge(40)),
+                Step::Wait(800),
+                Step::Tap(DOWN),
+                Step::Tap(A),
+                Step::Wait(1200),
+                Step::Tap(A),
+                Step::Tap(DOWN),
+                Step::Tap(A),
+                Step::Tap(DOWN),
+                Step::Tap(A),
+            ]
+        );
+        assert_eq!(
+            parse_script("d<5").0,
+            [Step::Until(Cond {
+                text: "d<5".into(),
+                op: Op::Lt,
+                n: 5
+            })]
+        );
+    }
+
+    #[test]
+    fn a_screen_wait_holds_until_the_count_held_for_half_a_second() {
+        // 40 draws from 2 s, a dip at 2.2 s, then 40 again from 2.3 s.
+        let draws = |ms: u64| {
+            if (2000..2200).contains(&ms) || ms >= 2300 {
+                40
+            } else {
+                5
+            }
+        };
+        let (s, held) = run("d>=40,A", 0, 400, 5000, draws);
+        // Held since 2.3 s: the wait ends at 2.8 s, and A is tapped then.
+        assert_eq!(s.tapped, [(2800, A)]);
+        assert_eq!(held[2790 / 10], 0);
+        assert_eq!(held[2800 / 10], A);
+    }
+
+    #[test]
+    fn a_repeat_stops_tapping_once_the_screen_changed() {
+        // The menu shows 25 draws from 4.05 s on.
+        let draws = |ms: u64| if ms >= 4050 { 25 } else { 4 };
+        let (s, _) = run("rep(A,1.5,d>=20),Down", 0, 400, 10_000, draws);
+        // A at 0, 1.5, 3 s; none at 4.5 s (the screen changed at 4.05 s);
+        // the condition held from then for 500 ms, so Down at 4.55 s.
+        assert_eq!(s.tapped, [(0, A), (1500, A), (3000, A), (4550, DOWN)]);
+    }
+
+    #[test]
+    fn a_wait_that_never_ends_stops_the_script() {
+        let (mut s, _) = run("A,d>=40,B", 0, 400, GIVE_UP_MS + 1000, |_| 5);
+        assert!(s.stopped);
+        assert_eq!(s.tapped, [(0, A)]);
+        assert_eq!(s.said, [(true, "gave up waiting for d>=40".to_owned())]);
+        // No further presses.
+        assert_eq!(s.advance(GIVE_UP_MS + 5000, 100), 0);
+        assert_eq!(s.tapped.len(), 1);
     }
 
     #[test]

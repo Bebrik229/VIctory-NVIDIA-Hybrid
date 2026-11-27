@@ -308,6 +308,67 @@ pub(crate) fn target_format(format: u32) -> u32 {
     format
 }
 
+/// (Fox T) Whether `this` is a title R9G9B9E5 texture (67) whose host copy is
+/// the 16-bit float RGBA stand-in ([`target_format`]).
+#[cfg(windows)]
+pub(crate) fn e5_stand_in(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 67 && stands_in(this)
+}
+
+/// (Fox T, `VICTORY_E5_ALPHA_ONE=1`, default off) A shader view of an R9G9B9E5
+/// target's stand-in reads alpha as 1, as a read of the console's format does
+/// (it has no alpha; the stand-in keeps what the pixel shader exported there).
+pub(crate) fn e5_alpha_one() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_E5_ALPHA_ONE").is_some_and(|v| v == "1"))
+}
+
+/// (Fox T, diagnostics) `VICTORY_E5_METER=1`: draws into R9G9B9E5 stand-in
+/// targets per frame, by pipeline and target index; line 'R9G9B9E5 targets'.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn e5_meter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_E5_METER").is_some_and(|v| v == "1"))
+}
+
+static E5_DRAWS: std::sync::Mutex<Option<std::collections::HashMap<(std::sync::Arc<str>, usize), u64>>> =
+    std::sync::Mutex::new(None);
+/// (`VICTORY_E5_ALPHA_ONE`) Views made with alpha read as 1, and of them
+/// with no description of the title's (left as they were).
+pub(crate) static E5_VIEWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A draw of `pipeline` into an R9G9B9E5 stand-in at target `index`.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn e5_draw(pipeline: &std::sync::Arc<str>, index: usize) {
+    let mut m = E5_DRAWS.lock().unwrap_or_else(|e| e.into_inner());
+    *m.get_or_insert_with(Default::default).entry((pipeline.clone(), index)).or_insert(0) += 1;
+}
+
+/// For the frame lines.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn e5_line(frames: f64) {
+    let f = frames.max(1.0);
+    if e5_alpha_one() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [a, b] = [0, 1].map(|i| E5_VIEWS[i].swap(0, Relaxed));
+        tracing::info!("R9G9B9E5 stand-in views (VICTORY_E5_ALPHA_ONE=1): {a} made with alpha read as 1, {b} without a description left as they were (since the last line)");
+    }
+    if !e5_meter() {
+        return;
+    }
+    let m = E5_DRAWS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let total: u64 = m.values().sum();
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let top: Vec<String> = v.iter().take(16).map(|((p, i), n)| format!("{p} (target {i}) {:.1}", *n as f64 / f)).collect();
+    tracing::info!(
+        "R9G9B9E5 targets (VICTORY_E5_METER, stand-in R16G16B16A16_FLOAT) per frame: {:.1} draws into them, {} pipelines; top: {}",
+        total as f64 / f,
+        v.len(),
+        top.join("; ")
+    );
+}
+
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
@@ -2460,6 +2521,50 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Snapshot of a `View::Shader` resource's host state in one lookup (`buffer` vs
+/// host `texture` vs deferred `waits`), avoiding repeated `resource()` and `made` locks.
+#[cfg(windows)]
+pub(crate) struct ShaderSrvState {
+    pub(crate) is_buffer: bool,
+    pub(crate) texture: Option<std::sync::Arc<HostTexture>>,
+    pub(crate) waits: bool,
+}
+
+#[cfg(windows)]
+pub(crate) fn shader_srv_state(this: This, for_draw: bool) -> ShaderSrvState {
+    if this.is_null() {
+        return ShaderSrvState {
+            is_buffer: false,
+            texture: None,
+            waits: false,
+        };
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return ShaderSrvState {
+            is_buffer: true,
+            texture: None,
+            waits: false,
+        };
+    }
+    let make = for_draw || !lazy();
+    if let Some((copy, _)) = hosted(this, make) {
+        return ShaderSrvState {
+            is_buffer: false,
+            texture: Some(copy),
+            waits: false,
+        };
+    }
+    let waits = !for_draw
+        && lazy()
+        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed);
+    ShaderSrvState {
+        is_buffer: false,
+        texture: None,
+        waits,
+    }
+}
+
 /// A title texture's host copy if it is made; not made here.
 #[cfg(windows)]
 pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -2634,6 +2739,7 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
 /// copy is made level by level and some level is held and has memory
 /// (`crate::tiles::Tiled::first_shown`).
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn first_shown(this: This) -> Option<u32> {
     host_tiled(this)?.tiled()?.first_shown()
 }
