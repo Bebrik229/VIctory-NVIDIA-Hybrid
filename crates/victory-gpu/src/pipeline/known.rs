@@ -61,7 +61,7 @@ fn book() -> Option<&'static Mutex<Book>> {
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
         let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
+            walk_shaders(&dir, |_, hash, _, _| { let _ = shaders.insert(hash); }),
             walk_pipelines(&dir, |_, bytes| {
                 keys.extend(bytes.first_chunk::<16>().copied());
             }),
@@ -197,6 +197,34 @@ pub fn keys(dir: &Path) -> Vec<String> {
     all
 }
 
+/// For each pipeline known in `dir`, in the file's order, whether
+/// `VICTORY_SKIP_PIPELINES` names one of its shaders: `victory warm` leaves
+/// those unmade, as a run leaves them unqueued.
+pub fn skipped(dir: &Path) -> Vec<bool> {
+    let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+    let skips = super::parse_skip_hashes(&value);
+    let mut all = Vec::new();
+    walk_pipelines(dir, |_, entry| all.push(matches_skip_list(entry, &skips)));
+    all
+}
+
+fn matches_skip_list(entry: &[u8], skips: &[String]) -> bool {
+    if skips.is_empty() {
+        return false;
+    }
+    let Some((&count, rest)) = entry.get(16..).and_then(|bytes| bytes.split_first()) else {
+        return false;
+    };
+    let Some(shaders) = rest.get(..usize::from(count) * 33) else {
+        return false;
+    };
+    shaders.chunks_exact(33).any(|shader| {
+        let hash = blake3::Hash::from_bytes(shader[1..].try_into().expect("recorded shader hash"));
+        let hex = hash.to_hex();
+        skips.iter().any(|skip| skip == &hex[..16])
+    })
+}
+
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
@@ -220,7 +248,7 @@ pub fn use_translations(dir: PathBuf) {
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
@@ -418,6 +446,45 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_warm_skip_can_match_any_shader_in_a_recipe() {
+        let mut entry = vec![0xff; 16];
+        entry.extend([2, 0]);
+        entry.extend([0x11; 32]);
+        entry.push(1);
+        entry.extend([0x22; 32]);
+        entry.push(0);
+
+        let skips = vec!["22".repeat(8)];
+        assert!(matches_skip_list(&entry, &skips));
+        assert!(!matches_skip_list(&entry, &["33".repeat(8)]));
+        assert!(!matches_skip_list(&entry, &[]));
+        assert!(!matches_skip_list(&entry[..entry.len() - 2], &skips));
+    }
+
+    #[test]
+    fn warm_skips_are_listed_in_the_order_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("victory-known-skips-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = Vec::new();
+        for hash in [0x11u8, 0x22, 0x33] {
+            let mut entry = vec![hash; 16];
+            entry.push(1);
+            entry.push(0);
+            entry.extend([hash; 32]);
+            entry.push(0);
+            file.extend((entry.len() as u32).to_le_bytes());
+            file.extend(entry);
+        }
+        std::fs::write(dir.join(PIPELINES), &file).unwrap();
+        let skips = vec!["22".repeat(8)];
+        let mut found = Vec::new();
+        walk_pipelines(&dir, |_, entry| found.push(matches_skip_list(entry, &skips)));
+        assert_eq!(found, [false, true, false]);
+        assert_eq!(skipped(&dir).len(), keys(&dir).len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_state_comes_back_as_it_was() {
