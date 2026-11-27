@@ -4059,6 +4059,16 @@ impl<'a> Lower<'a> {
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
+            // the way the lane went at the branches on a mask operation's SCC
+            // ([`Structured::wave_scc`]): with the wave, or by its own bit
+            Atom::Lane(v) if !self.lane_bits.contains_key(&v) && self.x.st.scc_some.contains_key(&v) => {
+                if !self.local && self.mask_data == MaskData::Console {
+                    self.scc_some(v)
+                } else {
+                    let own = self.x.st.scc_some[&v];
+                    self.boolean(own, at)
+                }
+            }
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)

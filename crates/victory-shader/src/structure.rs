@@ -445,9 +445,12 @@ pub struct Structured {
     pub scc_some: HashMap<Value, Bool>,
     /// Blocks closed by `s_cbranch_scc0/1` on such an SCC ([`Self::scc_some`]) of an operation
     /// that does not write EXEC: the console takes the branch by the whole wave, so the lanes
-    /// that follow it are not only those whose own bit is set. The way a lane went says what
-    /// the wave's SCC was, not what its own bit is, so EXEC stays a guard past the branch.
-    /// With the wave's condition for taking it: that SCC ([`Atom::Uniform`]) or the opposite.
+    /// that follow it are not only those whose own bit is set. With what a lane knows from
+    /// having taken it: only the way it went ([`Atom::Lane`] of the SCC value, or the
+    /// opposite), the same at every branch on that SCC. That is the wave's SCC where the
+    /// wave takes the branch and the lane's own bit where each lane still answers for itself
+    /// (pixel programs, local waves), so it implies neither: EXEC stays a guard past the
+    /// branch and the SCC as data stays what it is.
     pub wave_scc: HashMap<usize, Bool>,
 }
 
@@ -711,7 +714,7 @@ impl<'a> Lanes<'a> {
             // the wave's decision: it says nothing about this lane's own bit
             return c;
         }
-        // (the wave's SCC: the same for every branch on it, whatever the lane's own bit)
+        // (the way the lane went at a branch on the wave's SCC, [`Structured::wave_scc`])
         match self.wave_scc.get(&q).copied().or(self.when[q]) {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -1389,7 +1392,7 @@ impl<'a> Lanes<'a> {
             return None;
         }
         let born = self.born(scc);
-        let set = self.b.atom(Atom::Uniform(scc), born);
+        let set = self.b.atom(Atom::Lane(scc), born);
         Some(if inst.name() == "s_cbranch_scc1" { set } else { self.b.not(set) })
     }
 

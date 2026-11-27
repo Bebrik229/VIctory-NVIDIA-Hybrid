@@ -1093,3 +1093,20 @@ fn a_descriptor_loaded_behind_one_mask_scc_branch_is_known_behind_the_next() {
     lower::take_needs();
     local.expect("local waves");
 }
+
+/// What a lane knows past such a branch is the way it went, not the wave's SCC: where each
+/// lane still answers for itself (pixel programs, local waves) a lane whose own bit is clear
+/// goes the other way than the wave, so nothing that reads the SCC may be folded there.
+#[test]
+fn the_way_a_lane_went_at_a_mask_scc_branch_is_not_the_scc() {
+    let native = nested_mask_scc(SccUse::Branch);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    let st = structure::structure(&p).expect("structure");
+    assert!(!st.wave_scc.is_empty());
+    for &went in st.wave_scc.values() {
+        assert!(matches!(st.bools.support(went)[..], [structure::Atom::Lane(_)]));
+    }
+    for &reach in &st.reach {
+        assert!(!st.bools.support(reach).iter().any(|a| matches!(a, structure::Atom::Uniform(_))));
+    }
+}
