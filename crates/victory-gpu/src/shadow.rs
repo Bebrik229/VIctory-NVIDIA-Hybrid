@@ -1128,17 +1128,24 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    let mut last = 0;
+    for index in 1..ranges.len() {
+        let (from, to) = ranges[index];
+        if from <= ranges[last].1 {
+            ranges[last].1 = ranges[last].1.max(to);
+        } else {
+            last += 1;
+            ranges[last] = (from, to);
         }
     }
-    out
+    ranges.truncate(last + 1);
+    ranges
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1284,6 +1291,36 @@ mod card_tests {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
     }
+
+    /// A piece looks only at the joined ranges from the first that ends
+    /// past its start, and finds the parts the full search finds.
+    #[test]
+    fn a_piece_finds_its_parts_from_the_first_range_that_reaches_it() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as usize
+        };
+        for _ in 0..2000 {
+            let ranges: Vec<(usize, usize)> = (0..next(12))
+                .map(|_| {
+                    let from = next(200);
+                    (from, from + next(24))
+                })
+                .collect();
+            let skip = joined(ranges.clone());
+            let lo = next(200);
+            let hi = lo + 1 + next(40);
+            let near = &skip[skip.partition_point(|&(_, end)| end <= lo)..];
+            let mut parts = Vec::new();
+            super::for_outside(lo, hi, near.iter().copied(), |a, b| parts.push((a, b)));
+            let all = ranges.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
+            assert_eq!(parts, super::outside(lo, hi, all), "{ranges:?} around {lo}..{hi}");
+            assert_eq!(near.first().is_none_or(|&(start, _)| start >= hi), parts == [(lo, hi)]);
+        }
+    }
 }
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
@@ -1403,6 +1440,17 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
+    for_outside(from, to, skip, |a, b| out.push((a, b)));
+    out
+}
+
+/// Visits the parts of `[from, to)` outside ranges sorted by their start.
+fn for_outside(
+    from: usize,
+    to: usize,
+    skip: impl IntoIterator<Item = (usize, usize)>,
+    mut part: impl FnMut(usize, usize),
+) {
     let mut at = from;
     for (a, b) in skip {
         if b <= at {
@@ -1412,14 +1460,13 @@ fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize,
             break;
         }
         if a > at {
-            out.push((at, a));
+            part(at, a);
         }
         at = at.max(b);
     }
     if at < to {
-        out.push((at, to));
+        part(at, to);
     }
-    out
 }
 
 #[cfg(test)]
@@ -1994,24 +2041,53 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    wide_ranges(n, 1, move |range| range.for_each(&work));
+}
+
+/// Claims adjacent jobs together to keep small refreshes from contending
+/// on one atomic for each range. Long or uneven jobs can still claim one.
+pub(crate) fn wide_ranges(n: usize, grain: usize, work: impl Fn(std::ops::Range<usize>) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    let grain = grain.max(1);
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let threads = (wide_threads() + 1).min(n.div_ceil(grain));
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let i = next.fetch_add(grain, Ordering::Relaxed);
                     if i >= n {
                         break;
                     }
-                    work(i);
+                    work(i..i.saturating_add(grain).min(n));
                 }
             }) as Job
         })
         .collect();
     wide(jobs);
+}
+
+#[cfg(test)]
+mod wide_range_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_work_visits_each_index_once() {
+        for n in [0, 1, 7, 8, 9, 63, 64, 255, 513] {
+            let counts = Arc::new((0..n).map(|_| std::sync::atomic::AtomicU8::new(0)).collect::<Vec<_>>());
+            let shared = counts.clone();
+            wide_ranges(n, 8, move |range| {
+                for i in range {
+                    shared[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            assert!(counts.iter().all(|count| count.load(Ordering::Relaxed) == 1), "{n} jobs");
+        }
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -5039,14 +5115,19 @@ impl Shadow {
     /// # Safety
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
-    pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+    pub(crate) unsafe fn land_card(
+        &self,
+        pieces: impl Iterator<Item = (usize, usize, usize)> + Clone,
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
-        let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
+        let (from, to) = pieces.clone().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> =
             if !card.has_dirty.load(Ordering::Acquire) && !card.has_sent.load(Ordering::Acquire) {
                 Vec::new()
@@ -5059,20 +5140,31 @@ impl Shadow {
                 }
                 skip
             };
+        // Both sources of protected bytes can overlap. Join them once so
+        // each piece can find its first overlapping range by end address.
+        let skip = if skip.len() > 1 { joined(skip) } else { skip };
+        let mut partial = Vec::new();
         let mut put = 0;
-        for &(lo, hi, now) in pieces {
+        for (lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
+            let near = &skip[skip.partition_point(|&(_, end)| end <= lo)..];
+            let whole = [(0, hi - lo)];
+            let parts: &[(usize, usize)] = if near.first().is_none_or(|&(start, _)| start >= hi) {
+                &whole
+            } else {
+                partial.clear();
+                for_outside(lo, hi, near.iter().copied(), |a, b| partial.push((a - lo, b - lo)));
+                &partial
+            };
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5241,11 +5333,10 @@ mod land_tests {
                 for &(lo, hi) in &pieces {
                     one.card_merge_relay(lo, &now[lo..hi], after, &mut scratch);
                 }
-                let addressed: Vec<(usize, usize, usize)> =
-                    pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo)).collect();
+                let addressed = pieces.iter().map(|&(lo, hi)| (lo, hi, now.as_ptr() as usize + lo));
                 let mut notes = crate::land::Notes::default();
                 // SAFETY: the fetched bytes are `now`'s.
-                unsafe { many.land_card(&addressed, after, &mut notes) };
+                unsafe { many.land_card(addressed, after, &mut notes) };
                 notes.flush();
                 assert!(bytes(a) == bytes(b), "title memory, round {round}");
                 assert!(bytes(one.data as usize) == bytes(many.data as usize), "the CPU's side, round {round}");
@@ -5311,7 +5402,7 @@ mod land_tests {
                     let mut notes = crate::land::Notes::default();
                     let (lo, hi) = (b * PIECE, (b + 1) * PIECE);
                     // SAFETY: the fetched bytes are `now`'s; each block once.
-                    unsafe { shadow.land_card(&[(lo, hi, at + lo)], 8, &mut notes) };
+                    unsafe { shadow.land_card(std::iter::once((lo, hi, at + lo)), 8, &mut notes) };
                     notes.flush();
                 });
                 for i in (3..LEN / 4).step_by(4 * 53) {
