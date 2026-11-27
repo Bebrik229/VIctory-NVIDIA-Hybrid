@@ -99,8 +99,17 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 - `apps/victory` — CLI front end (`victory`)
 - `crates/victory-core`, `victory-pe`, `victory-loader`, `victory-hle`, `victory-gpu`, `victory-shader`, `victory-formats`, `victory-pipeline`, `victory-game` — core runtime, HLE, D3D12 backend, and GFX10-to-DXIL shader translator
 - `xtask` — repository policy verification (`cargo xtask policy`)
-- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix enabled)
+- `scripts/get-agility-sdk.ps1` — fetches DirectX 12 Agility SDK `1.619.6` (`D3D12Core.dll`) into `target\release\d3d12sdk\`
+- `scripts/run-nvidia-fast.ps1` — portable NVIDIA Hybrid launcher (`PORT_CBV=0` full-color fix + auto-fetches Agility SDK if missing)
 - `scripts/rt_off_hashes.txt` — `1,034` RT-off shader pipeline hashes
+
+---
+
+## Integrated NVIDIA & Performance Upgrades
+
+- **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
+- **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
+- **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + pipeline/warm-up wins (`#13`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
 
 ---
 
@@ -119,9 +128,15 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 cargo build --release -j 1 -p victory
 ```
 
-### Agility SDK runtime
+### 2. Install DirectX 12 Agility SDK 1.619.6 (Required — prevents `0x887E0003`)
 
-`victory.exe` requests the application-local DirectX Agility SDK 1.619 from a `d3d12sdk` folder beside the executable (`ID3D12Device13`, used by `VICTORY_PORT_CONSTANTS` and `VICTORY_INPLACE`). Download [Microsoft.Direct3D.D3D12 1.619.6](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.619.6), open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` into `target\release\d3d12sdk\`. Keep the folder beside the executable if you move it. `victory run`, `warm` and `replay` print a warning naming the expected path when the file is missing.
+`victory.exe` exports `D3D12SDKVersion = 619` and `D3D12SDKPath = ".\d3d12sdk\"` (`ID3D12Device13` / `OpenExistingHeapFromAddress1` for `VICTORY_PORT_CONSTANTS` / `VICTORY_INPLACE`). **Without `d3d12sdk\D3D12Core.dll` beside `victory.exe`, startup fails at DXR/root signature serialization with `D3D12_ERROR_INVALID_REDIST` (`0x887E0003`).**
+
+`.\scripts\run-nvidia-fast.ps1` downloads it automatically on first run, or install it manually:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\get-agility-sdk.ps1
+```
 
 ### 2. Launch (Recommended RTX 12 GB Fast Preset)
 
