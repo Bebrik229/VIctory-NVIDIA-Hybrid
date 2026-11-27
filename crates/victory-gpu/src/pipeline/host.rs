@@ -1208,10 +1208,16 @@ mod tests {
 
     #[test]
     fn blend_states_without_integer_blending_keep_active_targets() {
-        // No integer target: active blending is kept; unused slots are made inert.
+        // No integer target: one description for every target stays shared
+        // (the host reads only slot 0 of it).
         let b = blending(false);
         let t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT]);
         let host = host_blend(&b, &t);
+        assert!(!host.IndependentBlendEnable.as_bool());
+        assert!(host.RenderTarget[0].BlendEnable.as_bool());
+
+        // With a description per target, unused slots are made inert.
+        let host = host_blend(&blending(true), &t);
         assert!(host.RenderTarget[0].BlendEnable.as_bool());
         assert!(host.RenderTarget[1].BlendEnable.as_bool());
         assert!(host.RenderTarget[2..].iter().all(|t| !t.BlendEnable.as_bool()));
@@ -1228,6 +1234,9 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         let host = host_blend(&blending(false), &t);
+        assert!(!host.IndependentBlendEnable.as_bool());
+        assert!(host.RenderTarget[0].BlendEnable.as_bool());
+        let host = host_blend(&blending(true), &t);
         assert!(host.RenderTarget[0].BlendEnable.as_bool());
         assert!(host.RenderTarget[1..].iter().all(|t| !t.BlendEnable.as_bool()));
     }
