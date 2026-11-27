@@ -25,9 +25,12 @@ static CHOSEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
-    fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+    fn LoadLibraryExA(name: *const u8, file: *mut core::ffi::c_void, flags: u32) -> *mut core::ffi::c_void;
     fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> usize;
 }
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
 /// Under Wine (its ntdll exports `wine_get_version`) ours; on Windows the C
 /// runtime's. Neither lookup compares bytes with this program's `memcmp`.
@@ -42,7 +45,13 @@ fn choose() -> usize {
         } else {
             let mut module = GetModuleHandleA(c"vcruntime140.dll".as_ptr().cast());
             if module.is_null() {
-                module = LoadLibraryA(c"vcruntime140.dll".as_ptr().cast());
+                // Only from the system directory: never one beside the
+                // working directory or on the search path.
+                module = LoadLibraryExA(
+                    c"vcruntime140.dll".as_ptr().cast(),
+                    core::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                );
             }
             if module.is_null() { 0 } else { GetProcAddress(module, c"memcmp".as_ptr().cast()) }
         }
