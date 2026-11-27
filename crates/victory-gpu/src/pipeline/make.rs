@@ -24,7 +24,7 @@
 //! before their first dispatch, outside that frame budget: a missed head
 //! blendshape mapping leaves subsequent head skinning without its inputs.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -72,7 +72,7 @@ fn required_initialization(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_ComputeBlendshapeMappings")
 }
 
-fn left_out(shaders: &[Arc<Shader>], skip_hashes: &HashSet<String>) -> Option<&'static str> {
+fn left_out(shaders: &[Arc<Shader>], skip_hashes: &std::collections::HashSet<String>) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -133,7 +133,7 @@ impl Pending {
     fn new_with_skip_hashes(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
-        skip_hashes: &HashSet<String>,
+        skip_hashes: &std::collections::HashSet<String>,
     ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
@@ -780,7 +780,7 @@ mod tests {
                 translated: OnceLock::from(None),
             })
         };
-        let skips: HashSet<String> =
+        let skips: std::collections::HashSet<String> =
             super::super::parse_skip_hashes("32ed072b9f845048").into_iter().collect();
 
         let skipped = Arc::new(Pending::new_with_skip_hashes(
