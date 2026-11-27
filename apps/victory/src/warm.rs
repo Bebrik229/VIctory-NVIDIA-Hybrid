@@ -82,8 +82,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                     }
                     let mut rest = chunk;
                     while !rest.is_empty() {
-                        let list: Vec<String> = rest.iter().map(|&n| worker_request(n, offsets[n], &keys[n])).collect();
-                        let result = child(rest, &list.join(","), |n, ms, there| {
+                        let result = child(rest, |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
                             }
@@ -96,7 +95,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             }
                             drop(state);
                             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
-                        });
+                        }, |n| worker_request(n, offsets[n], &keys[n]));
                         let (made, ended) = match result {
                             Ok(done) => done,
                             Err(e) => {
@@ -225,14 +224,15 @@ impl Progress {
 /// Has a process make `these`; how many it made, and how it ended if not well.
 fn child(
     these: &[usize],
-    list: &str,
     mut each: impl FnMut(usize, f64, bool),
+    request: impl Fn(usize) -> String,
 ) -> Result<(usize, Option<String>)> {
+    let list: Vec<String> = these.iter().map(|&n| request(n)).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
         const IDLE_PRIORITY_CLASS: u32 = 0x40;
         Command::new(exe)
-            .args(["warm", "--these", list])
+            .args(["warm", "--these", &list.join(",")])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -339,19 +339,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_worker_is_told_where_its_recipes_are() {
-        let list = [worker_request(7, 0, "aa"), worker_request(2, 4096, "bb")].join(",");
-        assert_eq!(list, "7:0:aa,2:4096:bb");
-        let back = worker_requests(&list).unwrap();
-        let seen: Vec<_> = back.iter().map(|r| (r.index, r.offset, r.key)).collect();
-        assert_eq!(seen, [(7, 0, "aa"), (2, 4096, "bb")]);
-        // The form before offsets, or a torn one, is refused before any work.
-        for bad in ["7", "7:0", "7:x:aa", "x:0:aa", "7:0:aa,"] {
-            assert!(worker_requests(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn warm_results_follow_the_translator_and_driver() {
         let records = "current crashed exit code: 101\n\
                        current finished\n\
@@ -407,5 +394,18 @@ mod tests {
             p.record(&chunk, &format!("made {n} 0.00 0")).unwrap();
         }
         assert_eq!(p.finish(2, None).unwrap(), (2, None));
+    }
+
+    #[test]
+    fn a_worker_is_told_where_its_recipes_are() {
+        let list = [worker_request(7, 0, "aa"), worker_request(2, 4096, "bb")].join(",");
+        assert_eq!(list, "7:0:aa,2:4096:bb");
+        let back = worker_requests(&list).unwrap();
+        let seen: Vec<_> = back.iter().map(|r| (r.index, r.offset, r.key)).collect();
+        assert_eq!(seen, [(7, 0, "aa"), (2, 4096, "bb")]);
+        // The form before offsets, or a torn one, is refused before any work.
+        for bad in ["7", "7:0", "7:x:aa", "x:0:aa", "7:0:aa,"] {
+            assert!(worker_requests(bad).is_err(), "{bad}");
+        }
     }
 }
