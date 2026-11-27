@@ -320,6 +320,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_TITLE_PREWARM_COUNT=<n>` | after the first presented frame, a background thread makes up to `n` (at most 3584) 64 KiB title buffers ahead of the world, in batches of 32 for at most 8 s; stops and frees the unused ones under memory pressure. Off by default; does nothing with `VICTORY_WAIT_RESIDENT=0` (which `scripts/run-nvidia-fast.ps1` sets) |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash. `victory warm` leaves those pipelines unmade too; they are not marked done, so a later run without the hash makes them |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
