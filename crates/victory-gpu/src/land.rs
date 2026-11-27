@@ -200,6 +200,9 @@ struct Pool {
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
+    /// Lock-free hints for [`crate::shadow::spin`] before sleeping on `more` / `idle`.
+    queued: std::sync::atomic::AtomicUsize,
+    running: std::sync::atomic::AtomicUsize,
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
@@ -232,6 +235,8 @@ impl Pool {
             state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+            running: std::sync::atomic::AtomicUsize::new(0),
             turn: Mutex::new(()),
             threads,
         }));
@@ -252,21 +257,27 @@ impl Pool {
     fn help(&self) {
         // (The thread that calls `each` waits for this one's share.)
         let mut priority = crate::cores::Priority::new();
-        let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            crate::shadow::spin(|| self.queued.load(Ordering::Acquire) > 0);
+            let mut state = self.state();
+            let (work, i) = loop {
+                if let Some(found) = take(&mut state) {
+                    self.queued.store(state.count - state.next, Ordering::Relaxed);
+                    break found;
+                }
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
             };
             state.running += 1;
+            self.running.fetch_add(1, Ordering::Release);
             drop(state);
             priority.keep();
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
-            state = self.state();
+            let mut state = self.state();
             state.running -= 1;
+            self.running.fetch_sub(1, Ordering::AcqRel);
             state.panicked |= ran.is_err();
             if state.running == 0 {
                 self.idle.notify_all();
@@ -288,6 +299,7 @@ impl Pool {
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
         (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        self.queued.store(count, Ordering::Release);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -296,10 +308,18 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let mut state = self.state();
+                let Some((_, i)) = take(&mut state) else {
+                    self.queued.store(0, Ordering::Release);
+                    break;
+                };
+                self.queued.store(state.count - state.next, Ordering::Relaxed);
+                drop(state);
                 f(i);
             }
         }));
+        self.queued.store(0, Ordering::Release);
+        crate::shadow::spin(|| self.running.load(Ordering::Acquire) == 0);
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
@@ -343,15 +363,14 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, default half of logical cores
+/// clamped `4..=8` so bindless pass-0/heap sweeps scale across desktop CPUs).
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let default = std::thread::available_parallelism().map_or(if records { 6 } else { 4 }, |n| (n.get() / 2).clamp(4, 8));
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);

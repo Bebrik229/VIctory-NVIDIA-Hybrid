@@ -1132,11 +1132,16 @@ pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
 
-/// Configured `VICTORY_HEAP_ROUND` (default 16; `0`: only `changed` slots after pass 0).
+/// Full buffer-heap rescan cadence (`VICTORY_HEAP_RESCAN_FRAMES`, falling back to
+/// `VICTORY_HEAP_ROUND`, default 16; `0`: only `changed` slots after pass 0).
 fn heap_round() -> u64 {
     static ROUND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *ROUND.get_or_init(|| {
-        std::env::var("VICTORY_HEAP_ROUND").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(HEAP_ROUND)
+        std::env::var("VICTORY_HEAP_RESCAN_FRAMES")
+            .ok()
+            .or_else(|| std::env::var("VICTORY_HEAP_ROUND").ok())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(HEAP_ROUND)
     })
 }
 
@@ -1471,21 +1476,21 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
         let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
-        // (After each piece while the device lives: a cheap query.)
-        if alive
-            && let Some(why) = crate::descriptor::host::device_removed()
-            && !GONE.swap(true, Ordering::Relaxed)
-        {
-            let last: Vec<String> = parts[n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
         let _ = found[n].set(looked);
     });
+    if alive
+        && let Some(why) = crate::descriptor::host::device_removed()
+        && !GONE.swap(true, Ordering::Relaxed)
+    {
+        let last: Vec<String> = slots
+            .iter()
+            .take(16)
+            .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+            .map(|s| s.chars().take(200).collect())
+            .collect();
+        tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+        crate::host::log_removal_context();
+    }
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         let range = shows.map(|(range, written)| {
             if written {
@@ -1666,38 +1671,6 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut views = Vec::with_capacity(handles.len());
-        let mut keys = Vec::with_capacity(handles.len());
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
-                continue;
-            };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                // A typed null view (or a target without a host copy) still
-                // takes its slot: left out, the next live target would move
-                // into it and the pixel shader's outputs reach the wrong
-                // targets.
-                // shortcut: a view without a description or a format has no
-                // null view to stand for it and is left out, as before.
-                let null = record
-                    .desc()
-                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
-                if let Some(desc) = null {
-                    views.push((None, Some(desc)));
-                    keys.push((0, record.key()));
-                }
-                continue;
-            };
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
-            keys.push((texture.as_raw() as usize, record.key()));
-        }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1711,11 +1684,102 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
-        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        let dsv_key = dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key()));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
-            && self.host_targets.as_ref() == Some(&now)
-        {
+        let use_cache = *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"));
+
+        const MAX_RTV: usize = 8;
+        if handles.len() <= MAX_RTV {
+            let mut textures: [Option<&ID3D12Resource>; MAX_RTV] = [None; MAX_RTV];
+            let mut descs: [Option<D3D12_RENDER_TARGET_VIEW_DESC>; MAX_RTV] = [None; MAX_RTV];
+            let mut keys: [TargetKey; MAX_RTV] = [(0, (0, [0; 7])); MAX_RTV];
+            let mut count = 0usize;
+            for &h in handles {
+                let Some(record) = crate::descriptor::rtv_record(h) else {
+                    once!(
+                        handle = format_args!("{h:#x}"),
+                        "render target without a recorded view"
+                    );
+                    continue;
+                };
+                let Some(texture) = crate::resource::host_resource(record.resource) else {
+                    let null = record
+                        .desc()
+                        .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                    if let Some(desc) = null {
+                        descs[count] = Some(desc);
+                        keys[count] = (0, record.key());
+                        count += 1;
+                    }
+                    continue;
+                };
+                self.targets.push(record.resource as usize);
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                let raw = texture.as_raw() as usize;
+                textures[count] = Some(texture);
+                descs[count] = record.desc();
+                keys[count] = (raw, record.key());
+                count += 1;
+            }
+            if use_cache
+                && self
+                    .host_targets
+                    .as_ref()
+                    .is_some_and(|(cached, cached_dsv)| cached.as_slice() == &keys[..count] && *cached_dsv == dsv_key)
+            {
+                return;
+            }
+            let cached = self.host_targets.get_or_insert_default();
+            cached.0.clear();
+            cached.0.extend_from_slice(&keys[..count]);
+            cached.1 = dsv_key;
+            let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); MAX_RTV];
+            for i in 0..count {
+                rtvs[i] = host.rtv(textures[i], descs[i].as_ref());
+            }
+            let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+            // SAFETY: an open list; the views were just made.
+            unsafe {
+                list.list.OMSetRenderTargets(
+                    count as u32,
+                    (count > 0).then_some(rtvs.as_ptr()),
+                    false,
+                    dsv.as_ref().map(std::ptr::from_ref),
+                )
+            };
+            return;
+        }
+
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
+        for &h in handles {
+            let Some(record) = crate::descriptor::rtv_record(h) else {
+                once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target without a recorded view"
+                );
+                continue;
+            };
+            let Some(texture) = crate::resource::host_resource(record.resource) else {
+                let null = record
+                    .desc()
+                    .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                if let Some(desc) = null {
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
+                }
+                continue;
+            };
+            self.targets.push(record.resource as usize);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target(record.resource);
+            let raw = texture.as_raw() as usize;
+            views.push((Some(texture), record.desc()));
+            keys.push((raw, record.key()));
+        }
+        let now = (keys, dsv_key);
+        if use_cache && self.host_targets.as_ref() == Some(&now) {
             return;
         }
         self.host_targets = Some(now);
@@ -2349,18 +2413,21 @@ impl State {
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut count = 0usize;
             if let Some(h) = view_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[count] = Some(h);
+                count += 1;
             }
             if let Some(h) = sampler_heap {
                 list.keep(&h);
-                heaps.push(Some(h));
+                heaps[count] = Some(h);
+                count += 1;
             }
-            if !heaps.is_empty() {
+            if count > 0 {
                 // SAFETY: an open list and shader-visible heaps.
-                unsafe { l.SetDescriptorHeaps(&heaps) };
+                unsafe { l.SetDescriptorHeaps(&heaps[..count]) };
             }
             self.host_heaps = self.heaps;
             self.host_heaps_set = true;

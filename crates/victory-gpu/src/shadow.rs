@@ -409,6 +409,8 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Lock-free mirror of `!ranged.is_empty()` so un-ranged buffers skip `ranged` mutex.
+    has_ranged: AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2011,12 +2013,21 @@ struct Workers {
     there: std::sync::atomic::AtomicUsize,
 }
 
-/// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
-/// most (0, the default: not at all): asleep, a thread is woken in 50 us and
-/// more, 95 times a frame.
-fn spin(there: impl Fn() -> bool) {
+/// Waits awake until `there` says so, `VICTORY_WAIT_SPIN` (or `VICTORY_WIDE_SPIN`) microseconds
+/// at most (0 by default): asleep, a thread is woken in 50 us and more, ~100 times a frame.
+pub(crate) fn wait_spin() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WAIT_SPIN")
+            .ok()
+            .or_else(|| std::env::var("VICTORY_WIDE_SPIN").ok())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+pub(crate) fn spin(there: impl Fn() -> bool) {
+    let most = wait_spin();
     if most == 0 {
         return;
     }
@@ -2028,15 +2039,15 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, clamped `1..=12`).
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`, clamped `1..=16`).
 fn wide_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
         std::env::var("VICTORY_WIDE_THREADS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
-            .clamp(1, 12)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 12))
+            .clamp(1, 16)
     })
 }
 
@@ -3732,6 +3743,7 @@ impl Shadow {
             len,
             copied: Mutex::new(CopiedPages::new(pages)),
             ranged: Mutex::default(),
+            has_ranged: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             has_pending: AtomicBool::new(false),
@@ -4528,6 +4540,15 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        self.nothing_new_inner(None, address, len)
+    }
+
+    /// As [`Shadow::nothing_new`], reusing a shared [`crate::watch::JournalRead`].
+    pub(crate) fn nothing_new_with(&self, journal: &crate::watch::JournalRead, address: usize, len: usize) -> bool {
+        self.nothing_new_inner(Some(journal), address, len)
+    }
+
+    fn nothing_new_inner(&self, journal: Option<&crate::watch::JournalRead>, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -4564,8 +4585,12 @@ impl Shadow {
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = self.ranged(from, to);
         let base = start / PAGE;
-        let same = (ranged != 0 || copied.range_all_copied(from / PAGE - base, (to - 1) / PAGE - base))
-            && crate::watch::nothing_new(from, to, base, &copied.at, ranged);
+        let all_copied = ranged != 0 || copied.range_all_copied(from / PAGE - base, (to - 1) / PAGE - base);
+        let same = all_copied
+            && match journal {
+                Some(j) => crate::watch::nothing_new_with(j, from, to, base, &copied.at, ranged),
+                None => crate::watch::nothing_new(from, to, base, &copied.at, ranged),
+            };
         drop(copied);
         if let Some(at) = looked {
             crate::copystep::stamp_looked(stamped, same, at);
@@ -4591,6 +4616,9 @@ impl Shadow {
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
+        if !self.has_ranged.load(Ordering::Acquire) {
+            return 0;
+        }
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
@@ -4708,6 +4736,7 @@ impl Shadow {
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
+            self.has_ranged.store(true, Ordering::Release);
         }
         drop(copied);
         bytes

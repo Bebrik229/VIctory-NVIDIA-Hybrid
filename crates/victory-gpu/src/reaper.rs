@@ -69,7 +69,22 @@ struct Reapers {
     next: AtomicU64,
 }
 
-/// The reaper's workers (`0`: list recycle + drops; `1`: extra drop worker),
+/// Worker threads for `VICTORY_REAPER=1` (`VICTORY_REAPER_THREADS`, clamped `1..=16`):
+/// worker `0` keeps ordered list resets, remaining workers share background COM drops.
+fn worker_count() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        std::env::var("VICTORY_REAPER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(2, 6))
+            })
+            .clamp(1, 16)
+    })
+}
+
+/// The reaper's workers (`0`: list recycle + fallback drops; `1..`: parallel drop workers),
 /// `None` when off or when no thread could be made.
 fn reapers() -> Option<&'static Reapers> {
     if !on() {
@@ -78,8 +93,9 @@ fn reapers() -> Option<&'static Reapers> {
     static REAPERS: OnceLock<Option<Reapers>> = OnceLock::new();
     REAPERS
         .get_or_init(|| {
-            let mut txs = Vec::with_capacity(2);
-            for i in 0..2usize {
+            let count = worker_count();
+            let mut txs = Vec::with_capacity(count);
+            for i in 0..count {
                 let (tx, rx) = std::sync::mpsc::channel::<Job>();
                 let thread_name = if i == 0 {
                     "victory-reaper".to_owned()
@@ -111,14 +127,15 @@ fn reapers() -> Option<&'static Reapers> {
         .as_ref()
 }
 
-/// Runs `work` on a background reaper worker (`ordered`: pinned to worker 0), or inline when off.
+/// Runs `work` on a background reaper worker (`ordered`: pinned to worker 0; unordered drops
+/// spread across workers `1..` so list recycles never wait behind COM release storms), or inline when off.
 fn run(ordered: bool, work: impl FnOnce() + 'static) {
     match reapers() {
         Some(r) => {
             let idx = if ordered || r.txs.len() == 1 {
                 0
             } else {
-                (r.next.fetch_add(1, Relaxed) as usize) % r.txs.len()
+                1 + (r.next.fetch_add(1, Relaxed) as usize) % (r.txs.len() - 1)
             };
             if let Err(std::sync::mpsc::SendError(Job(work))) = r.txs[idx].send(Job(Box::new(work))) {
                 work();

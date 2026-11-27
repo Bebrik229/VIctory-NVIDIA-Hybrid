@@ -46,6 +46,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// Report the first request that outlived its frame's compile budget.
     reported_pending: AtomicBool,
+    /// When a live draw first waited on this pipeline: later frames stop spending a fresh wait budget on it.
+    first_wait: OnceLock<Instant>,
     /// Distinguishes work created during loading from first-use creation.
     created_at: Instant,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
@@ -314,6 +316,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             reported_pending: AtomicBool::new(false),
+            first_wait: OnceLock::new(),
             created_at: Instant::now(),
         }
     }
@@ -490,6 +493,11 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    let first_wait = p.first_wait.get_or_init(Instant::now);
+    let pipeline_left = budget.saturating_sub(first_wait.elapsed());
+    if pipeline_left.is_zero() {
+        return;
+    }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -500,7 +508,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(pipeline_left);
         if shared {
             spent.1 += left;
         }
@@ -1173,5 +1181,19 @@ mod tests {
             default_off,
         );
         assert_eq!(rt_skin_default.left_out, None);
+    }
+
+    #[test]
+    fn pending_pipeline_does_not_wait_a_fresh_budget_each_frame() {
+        let skips = std::collections::HashSet::new();
+        let policy = DeadRtPolicy {
+            skip_dead: false,
+            skip_gather_copy: false,
+        };
+        let p = Pending::new_with(Vec::new(), None, &skips, policy);
+        wait(&p, 900_000);
+        let started = Instant::now();
+        wait(&p, 900_001);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }

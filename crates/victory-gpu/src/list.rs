@@ -807,6 +807,95 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Stack-backed barrier buffer for the common `<= 16` barrier batch, falling back to `Vec` when larger.
+enum HostBarriers {
+    Stack {
+        items: [std::mem::MaybeUninit<Barrier>; 17],
+        len: usize,
+    },
+    Heap(Vec<Barrier>),
+}
+
+impl HostBarriers {
+    fn new(max_len: usize) -> Self {
+        if max_len <= 16 {
+            Self::Stack {
+                items: [const { std::mem::MaybeUninit::uninit() }; 17],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(max_len + 1))
+        }
+    }
+
+    fn as_slice(&self) -> &[Barrier] {
+        match self {
+            Self::Stack { items, len } => {
+                // SAFETY: `0..*len` are initialized `Barrier` values.
+                unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<Barrier>(), *len) }
+            }
+            Self::Heap(v) => v,
+        }
+    }
+
+    fn push(&mut self, barrier: Barrier) {
+        match self {
+            Self::Stack { items, len } if *len < items.len() => {
+                items[*len].write(barrier);
+                *len += 1;
+            }
+            Self::Stack { .. } => {
+                let mut v = Vec::with_capacity(32);
+                v.extend_from_slice(self.as_slice());
+                v.push(barrier);
+                *self = Self::Heap(v);
+            }
+            Self::Heap(v) => v.push(barrier),
+        }
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&Barrier) -> bool) {
+        match self {
+            Self::Stack { items, len } => {
+                // SAFETY: `0..*len` are initialized `Barrier` values (`Barrier` is `Copy`).
+                let slice = unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast::<Barrier>(), *len) };
+                let mut write = 0;
+                for read in 0..slice.len() {
+                    if keep(&slice[read]) {
+                        slice[write] = slice[read];
+                        write += 1;
+                    }
+                }
+                *len = write;
+            }
+            Self::Heap(v) => v.retain(|b| keep(b)),
+        }
+    }
+}
+
+/// Emits targeted UAV barriers using a stack array for small batches (`<= 16`).
+#[cfg(windows)]
+fn emit_targeted_uav_barriers(
+    list: &crate::host::HostList,
+    texs: &[windows::Win32::Graphics::Direct3D12::ID3D12Resource],
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    if texs.len() <= 16 {
+        let mut buf = [const { std::mem::MaybeUninit::<D3D12_RESOURCE_BARRIER>::uninit() }; 16];
+        for (slot, tex) in buf.iter_mut().zip(texs) {
+            slot.write(crate::host::uav_barrier_for(tex));
+        }
+        // SAFETY: `texs.len()` entries were initialized above with borrowed pointers (no Drop ownership).
+        let uavs = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(), texs.len()) };
+        // SAFETY: an open list and live host textures.
+        unsafe { list.list.ResourceBarrier(uavs) };
+    } else {
+        let uavs: Vec<_> = texs.iter().map(crate::host::uav_barrier_for).collect();
+        // SAFETY: an open list and live host textures.
+        unsafe { list.list.ResourceBarrier(&uavs) };
+    }
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -818,10 +907,12 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host = HostBarriers::new(barriers.len());
+        for b in barriers {
+            if let Some(mapped) = host_barrier(list, b) {
+                host.push(mapped);
+            }
+        }
         let native = native_elide();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for earlier shader writes when it leaves
@@ -839,13 +930,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                             before == 0 || (before & (0x8 | 0x10 | 0x100 | 0x400 | 0x40_0000)) != 0
                         }))
         }) {
-            if !host.iter().any(|h| h.kind == 2 && h.first.is_null()) {
+            if !host.as_slice().iter().any(|h| h.kind == 2 && h.first.is_null()) {
                 host.push(UAV_BARRIER);
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
-        let has_global = host.iter().any(|h| h.kind == 2 && h.first.is_null());
+        let has_global = host.as_slice().iter().any(|h| h.kind == 2 && h.first.is_null());
         if native {
             if has_global {
                 if list.take_uav_dirty() {
@@ -857,7 +948,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     count_barrier_elided(1);
                 }
             } else {
-                let targeted = host.iter().filter(|h| h.kind == 2 && !h.first.is_null()).count() as u64;
+                let targeted = host.as_slice().iter().filter(|h| h.kind == 2 && !h.first.is_null()).count() as u64;
                 if targeted > 0 {
                     if !list.is_uav_dirty() {
                         host.retain(|h| !(h.kind == 2 && !h.first.is_null()));
@@ -870,6 +961,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         } else if has_global {
             list.clear_uav_dirty();
         }
+        let host = host.as_slice();
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -2652,10 +2744,8 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
                     count_barrier_elided(1);
                     return;
                 }
-                let uavs: Vec<_> = texs.iter().map(crate::host::uav_barrier_for).collect();
-                count_barrier_targeted(uavs.len() as u64);
-                // SAFETY: an open list and live host textures.
-                unsafe { list.list.ResourceBarrier(&uavs) };
+                count_barrier_targeted(texs.len() as u64);
+                emit_targeted_uav_barriers(list, &texs);
             }
             enhanced_barrier::GroupSync::Global => {
                 if !list.take_uav_dirty() {
