@@ -86,7 +86,8 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 | `avatarmanz/VIctory-7900XTX` baseline | 1080p | `7.0 fps` (`143.2 ms`) | `preparing 19.7 ms`, `copy-back 10.1 ms` |
 | `vicky-cgbj` Ports 1, 6, 7 | 1080p, `Series S` | `10.5 fps` (`95.3 ms`) | `GPU 52.7 ms`, `Commit 16.90 GB` |
 | `vicky-cgbj` Ports 1, 5, 6, 7 | 1080p, `Series S` | `11.4 fps` median (`87.5 ms`, peak `13.1 fps`) | `GPU 47.2 ms` |
-| **`VIctory-NVIDIA-Hybrid` + Native Barriers** | **1080p `Scale=0.5`, `Series S`** | **`11.6–16.0 fps`** (median **`~14.5 fps`**, steady **`15.3–16.0 fps` / `62.5–65.5 ms`**) | `5.1k–5.7k draws/f`, `GPU wait 0.0–10.4 ms`, **`0` OOM, `0` descriptor cap** (`~29–32 fps` perceived with NVIDIA Smooth Motion 2x) |
+| **`VIctory-NVIDIA-Hybrid` + Native Barriers (pre-PR #1/`#26`)** | **1080p `Scale=0.5`, `Series S`** | **`11.6–16.0 fps`** (median **`~14.5 fps`**, steady **`15.3–16.0 fps` / `62.5–65.5 ms`**) | `5.1k–5.7k draws/f`, `GPU wait 0.0–10.4 ms`, **`0` OOM, `0` descriptor cap** (`~29–32 fps` perceived with NVIDIA Smooth Motion 2x) |
+| **`VIctory-NVIDIA-Hybrid` Latest (`#12`/`#21`/`#32`/`#35`/`#37`/`#44`/`#46`, Full Color)** | **1080p `Scale=0.5`, `Series S`** | **`9.3–16.1 fps`** (`62.0–107.1 ms/f`: `13.0–16.1 fps` open outdoor, `9.3–10.1 fps` `4.4k` draws dock/interior) | **CPU `preparing` cut to `18.0–20.5 ms`**, **`96–97%` GPU utilization**, `0` OOM, `0` descriptor cap |
 | **`VIctory-NVIDIA-Hybrid` 2K Full Color** | **`Series X`, `2560x1440`, `Scale=0.67`, `PORT_CBV=0`** | **`7.9 fps` median** (`7.6–8.5 fps`, `118–132 ms/f`) | `8,220 draws/f`, `22.89 GB WS`, `20.87 GB Commit`, **`0` OOM, `0` descriptor cap, full color verified** |
 | `VIctory-NVIDIA-Hybrid` Native 2K | `Series X`, `2560x1440`, `Scale=1.0` | `4.7–5.3 fps` (`190–211 ms/f`) | `12.4k–13.0k draws/f`, `9.99 GB` VRAM, `0` crashes |
 
@@ -109,7 +110,7 @@ Test platform: **AMD Ryzen 7 7800X3D**, **NVIDIA RTX 5070 12 GB**, **32 GB RAM**
 
 - **NVIDIA bitwise `rndne_f32` & pipeline state + parallel slot reuse (`#1`, `#2`, `#3`):** IEEE-754 bitwise round-to-nearest-even for NVIDIA DXIL drivers, hardened descriptor slot reuse under parallel split submissions, and Port 1 indirect argument ordering (fixes palm/lamp flicker).
 - **Release F3 stats panel & 32-lane water light skip (`#26`):** toggleable F3 overlay in every build + skips 64-lane-wide water tiled light computes on 32-lane NVIDIA hosts (`VICTORY_WATER_LIGHT=1` overrides).
-- **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + pipeline/warm-up wins (`#13`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
+- **AVX2/SSE2 micro-tile texture detiler (`#44`) + O(dirty) `shadow.rs` AVX2 (`#46`) + CPU/relay optimization wave (`#12`, `#13`, `#21`, `#28`, `#32`, `#35`, `#37`, `#40`, `#45`):** faster CPU texture detiling (`DetilePool`), O(dirty) shadow page planning + AVX2 `Shadow::take`, allocation-free write-watch shard walk (`#35`), uncovered-only title memory zeroing (`#28`), readback scratch/range merge reuse (`#32`) + pooled readback buffers (`VICTORY_READBACK_POOL=1`, `#12`), early relay command list recycling (`VICTORY_RECYCLE_LANDED_EARLY=1`, `#21`), batched CBV fill planning (`#37`), single-guard fast path, pre-enqueue `VICTORY_SKIP_PIPELINES` across `run` & `warm`, and resilient pipeline cache saves.
 
 ---
 
