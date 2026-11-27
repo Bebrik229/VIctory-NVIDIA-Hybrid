@@ -152,7 +152,13 @@ struct Through {
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// The written texture the layouts were made for: the title can put
+    /// another one in the view's memory.
+    written: Written,
 }
+
+/// Format, width, height, depth or layers, levels.
+type Written = (i32, u64, u32, u16, u16);
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
@@ -191,11 +197,20 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
+        // SAFETY: a live texture.
+        let of_from = unsafe { from.GetDesc() };
+        let written: Written = (
+            of_from.Format.0,
+            of_from.Width,
+            of_from.Height,
+            of_from.DepthOrArraySize,
+            of_from.MipLevels,
+        );
         match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
-            None => {
-                // SAFETY: live textures.
-                let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
+            Some(through) if through.written == written => through.clone(),
+            _ => {
+                // SAFETY: a live texture.
+                let of_to = unsafe { to.GetDesc() };
                 // Levels times layers (a volume's slices are one part).
                 let count = |d: &D3D12_RESOURCE_DESC| {
                     let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -268,13 +283,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let through = Arc::new(Through {
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    written,
                 });
                 map.insert(placed as usize, through.clone());
                 through
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(placed as usize, to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -289,7 +305,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
