@@ -47,6 +47,21 @@ if (-not (Test-Path $HashesFile)) {
 if (-not (Test-Path $ExePath)) {
     throw "Missing victory.exe at $ExePath. Build first with: cargo build --release -j 1 -p victory"
 }
+$AgilityDir = Join-Path (Split-Path $ExePath) 'd3d12sdk'
+$AgilityCore = Join-Path $AgilityDir 'D3D12Core.dll'
+if (-not (Test-Path $AgilityCore)) {
+    $AgilityScript = Join-Path $LocalRepoRoot 'scripts\get-agility-sdk.ps1'
+    if (-not (Test-Path $AgilityScript)) {
+        $AgilityScript = Join-Path $RepoRoot 'scripts\get-agility-sdk.ps1'
+    }
+    if (Test-Path $AgilityScript) {
+        Write-Host "[run-nvidia-fast] Missing d3d12sdk\D3D12Core.dll (would fail with 0x887E0003). Auto-fetching Agility SDK 1.619.6..." -ForegroundColor Yellow
+        & $AgilityScript -OutDir $AgilityDir
+    }
+    if (-not (Test-Path $AgilityCore)) {
+        throw "Missing $AgilityCore (D3D12_ERROR_INVALID_REDIST 0x887E0003). Run .\scripts\get-agility-sdk.ps1 first."
+    }
+}
 if (-not (Test-Path $HashesFile)) {
     throw "Missing rt_off_hashes.txt at $HashesFile"
 }
@@ -119,7 +134,7 @@ $env:VICTORY_CACHE_DIR = $CacheDir
 
 $env:VICTORY_OUTPUT = $Output
 $env:VICTORY_FRAME_INTERVAL_MS = '16.667'
-$env:VICTORY_PANEL = '1'
+$env:VICTORY_PANEL = if ($env:VICTORY_PANEL) { $env:VICTORY_PANEL } else { '0' }
 $env:VICTORY_MOUSE_LOOK = if ($env:VICTORY_MOUSE_LOOK) { $env:VICTORY_MOUSE_LOOK } else { '1' }
 $env:VICTORY_MOUSE_SENS = if ($env:VICTORY_MOUSE_SENS) { $env:VICTORY_MOUSE_SENS } else { '1.0' }
 $env:VICTORY_MOUSE_INVERT_Y = if ($env:VICTORY_MOUSE_INVERT_Y) { $env:VICTORY_MOUSE_INVERT_Y } else { '0' }
