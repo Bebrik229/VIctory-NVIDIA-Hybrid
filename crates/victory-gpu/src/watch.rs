@@ -1133,6 +1133,7 @@ fn alone(start: usize, end: usize, pages: usize, took: std::time::Duration) {
 
 /// Diagnostics, for the frame lines: [`ALONE`] per frame, the busiest.
 #[cfg(feature = "diagnostics")]
+#[allow(dead_code)]
 pub(crate) fn alone_line(frames: f64) {
     let all = ALONE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     if all.is_empty() {
@@ -3192,6 +3193,16 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     if first >= last {
         return 0;
     }
+    if first + 1 == last {
+        let protected = g.protected.contains(first);
+        if !g.aliased.contains(first) {
+            if protected {
+                unguard(g, &[first]);
+                return 1;
+            }
+            return 0;
+        }
+    }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
@@ -3663,7 +3674,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
-    open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+    open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
