@@ -39,7 +39,12 @@ $Exe = (Resolve-Path -LiteralPath $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
     if (-not $SkipShaders) {
-        $config = & $victory config
+        # victory writes UTF-8; without this a path outside the console's code page is misread.
+        $encoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $config = & $victory config
+        } finally { [Console]::OutputEncoding = $encoding }
         if ($LASTEXITCODE -eq 0) {
             $cache = $config | Select-String '^cache_dir\s*:\s*(.+)$' | Select-Object -First 1
             if ($cache) {
