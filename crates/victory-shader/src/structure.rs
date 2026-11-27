@@ -449,8 +449,10 @@ pub struct Structured {
     /// having taken it: only the way it went ([`Atom::Lane`] of the SCC value, or the
     /// opposite), the same at every branch on that SCC. That is the wave's SCC where the
     /// wave takes the branch and the lane's own bit where each lane still answers for itself
-    /// (pixel programs, local waves), so it implies neither: EXEC stays a guard past the
-    /// branch and the SCC as data stays what it is.
+    /// (pixel programs, local waves), so it does not imply the lane's bit, and EXEC stays a
+    /// guard past the branch. Either way a lane that went the way of a set SCC knows the SCC
+    /// is set (some lane's bit is, its own where it answered for itself); one that went the
+    /// other way knows nothing of the SCC as data.
     pub wave_scc: HashMap<usize, Bool>,
 }
 
@@ -548,6 +550,9 @@ struct Lanes<'a> {
     wave_any: Vec<Option<bool>>,
     /// See [`Structured::wave_scc`].
     wave_scc: HashMap<usize, Bool>,
+    /// Per block of [`Self::wave_scc`]: its SCC as data, and whether the taken side is the
+    /// set one.
+    wave_scc_set: HashMap<usize, (Bool, bool)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -629,6 +634,7 @@ impl<'a> Lanes<'a> {
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
             wave_scc: HashMap::new(),
+            wave_scc_set: HashMap::new(),
         })
     }
 
@@ -641,6 +647,7 @@ impl<'a> Lanes<'a> {
         self.scc_every.clear();
         self.wave_any.fill(None);
         self.wave_scc.clear();
+        self.wave_scc_set.clear();
         self.joins.clear();
         self.phi_joins.clear();
         self.phi_join_ids.clear();
@@ -700,8 +707,9 @@ impl<'a> Lanes<'a> {
             {
                 self.when[b] = Some(self.branch(last));
                 self.wave_any[b] = self.wave_kind(last);
-                if let Some(w) = self.wave_scc_branch(last) {
+                if let Some((w, set)) = self.wave_scc_branch(last) {
                     self.wave_scc.insert(b, w);
+                    self.wave_scc_set.insert(b, (set, last.name() == "s_cbranch_scc1"));
                 }
             }
         }
@@ -715,6 +723,10 @@ impl<'a> Lanes<'a> {
             return c;
         }
         // (the way the lane went at a branch on the wave's SCC, [`Structured::wave_scc`])
+        let c = match self.wave_scc_set.get(&q) {
+            Some(&(set, on_taken)) if on_taken == taken => self.b.and(c, set),
+            _ => c,
+        };
         match self.wave_scc.get(&q).copied().or(self.when[q]) {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -1378,7 +1390,7 @@ impl<'a> Lanes<'a> {
     }
 
     /// See [`Self::wave_scc`].
-    fn wave_scc_branch(&mut self, inst: &Inst) -> Option<Bool> {
+    fn wave_scc_branch(&mut self, inst: &Inst) -> Option<(Bool, Bool)> {
         if !matches!(inst.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
             return None;
         }
@@ -1392,8 +1404,9 @@ impl<'a> Lanes<'a> {
             return None;
         }
         let born = self.born(scc);
-        let set = self.b.atom(Atom::Lane(scc), born);
-        Some(if inst.name() == "s_cbranch_scc1" { set } else { self.b.not(set) })
+        let went = self.b.atom(Atom::Lane(scc), born);
+        let set = self.b.atom(Atom::Uniform(scc), born);
+        Some((if inst.name() == "s_cbranch_scc1" { went } else { self.b.not(went) }, set))
     }
 
     fn branch(&mut self, inst: &Inst) -> Bool {

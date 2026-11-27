@@ -1096,17 +1096,47 @@ fn a_descriptor_loaded_behind_one_mask_scc_branch_is_known_behind_the_next() {
 
 /// What a lane knows past such a branch is the way it went, not the wave's SCC: where each
 /// lane still answers for itself (pixel programs, local waves) a lane whose own bit is clear
-/// goes the other way than the wave, so nothing that reads the SCC may be folded there.
+/// goes the way of a clear SCC while the wave's is set, so nothing that reads the SCC may be
+/// folded on that side.
 #[test]
 fn the_way_a_lane_went_at_a_mask_scc_branch_is_not_the_scc() {
     let native = nested_mask_scc(SccUse::Branch);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
     let st = structure::structure(&p).expect("structure");
-    assert!(!st.wave_scc.is_empty());
-    for &went in st.wave_scc.values() {
+    assert_eq!(st.wave_scc.len(), 1);
+    for (&b, &went) in &st.wave_scc {
         assert!(matches!(st.bools.support(went)[..], [structure::Atom::Lane(_)]));
+        // (`s_cbranch_scc0`: the taken side is the one of a clear SCC)
+        let structure::LaneExit::Branch { taken, not_taken, .. } = st.exits[b] else {
+            panic!("a branch");
+        };
+        let knows_scc = |b: usize| {
+            st.bools.support(st.reach[b]).iter().any(|a| matches!(a, structure::Atom::Uniform(_)))
+        };
+        assert!(!knows_scc(taken));
+        assert!(knows_scc(not_taken));
     }
-    for &reach in &st.reach {
-        assert!(!st.bools.support(reach).iter().any(|a| matches!(a, structure::Atom::Uniform(_))));
-    }
+}
+
+/// EXEC selected by the SCC behind a branch on it: a lane that went the way of a set SCC
+/// knows which mask was selected, as it did when its own bit decided the branch.
+#[test]
+fn exec_selected_by_the_mask_scc_behind_its_branch_still_lowers() {
+    let native = native(&[
+        0xBF8C_0000, // s_waitcnt 0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0x8792_7E6A, // s_and_b64 s[18:19], vcc, exec
+        0xBF84_0005, // s_cbranch_scc0 past the store
+        0x85FE_7E12, // s_cselect_b64 exec, s[18:19], exec
+        0x7E04_0282, // v_mov_b32 v2, 2
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("IR");
+    lowered_on(&native, &p, &HashSet::new(), 64).expect("console waves");
+    lowered(&native, &p, &HashSet::new()).expect("two host waves");
+    let local = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new()));
+    lower::take_needs();
+    local.expect("local waves");
 }
