@@ -5522,6 +5522,69 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             building: None,
         },
     );
+    crate::copy_ahead::declared(resource, start);
+}
+
+/// With [`crate::copy_ahead`]: makes the copy of the buffer `resource` at
+/// `start` if the title has not let it go and no ask made the copy yet.
+/// Returns its length and whether a copy was made.
+pub(crate) fn copy_ahead_of(resource: usize, start: u64) -> Option<(u64, bool)> {
+    let key = (start, resource);
+    loop {
+        {
+            let map = buffers_read();
+            let entry = map.get(&key)?;
+            if entry.shadow.is_some() {
+                return Some((entry.end - start, false));
+            }
+        }
+        let mut map = buffers();
+        let entry = map.get_mut(&key)?;
+        let len = entry.end - start;
+        if entry.shadow.is_some() {
+            return Some((len, false));
+        }
+        let size = len.next_multiple_of(1 << 16);
+        let big = cards() && (size >= card_limits().0 || card_all());
+        if let Some(placed) = crate::port::place_for(key.0, len, false)
+            .or_else(|| if big { None } else { crate::inplace::place_for(key.0, len, false) })
+        {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return Some((len, true));
+        }
+        if crate::port::on() || crate::inplace::level() >= 2 {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            entry.shadow = Some(copied_buffer(key.0, len, size, buffer, data));
+            return Some((len, true));
+        }
+        let ticket = entry.building.get_or_insert_with(Default::default).clone();
+        drop(map);
+        let _only = ticket.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let map = buffers_read();
+            let Some(entry) = map.get(&key) else {
+                return None;
+            };
+            if entry.shadow.is_some() {
+                return Some((entry.end - start, false));
+            }
+            if !still_building(entry, &ticket) {
+                continue;
+            }
+        }
+        let backing = host()?.shared_buffer(size);
+        let mut map = buffers();
+        if !map.get(&key).is_some_and(|e| still_building(e, &ticket)) {
+            drop(map);
+            drop(backing);
+            continue;
+        }
+        let (buffer, data) = backing?;
+        let entry = map.get_mut(&key)?;
+        entry.shadow = Some(copied_buffer(key.0, len, size, buffer, data));
+        entry.building = None;
+        return Some((len, true));
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.

@@ -95,6 +95,10 @@ pub(super) fn stage() -> u32 {
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
+    // Renderer port RT: this order is its part 1.
+    if crate::port_rt::on() {
+        return true;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
@@ -555,7 +559,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     {
         let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].place.0);
         let cut = place(placed)? + 1;
-        if place(reader)? >= cut {
+        let apart = place(reader)? >= cut;
+        crate::port_rt::count(if apart { crate::port_rt::CUT } else { crate::port_rt::SAME_LIST });
+        if apart {
             return Some(cut);
         }
     }
@@ -796,7 +802,18 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, mut steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let by_order = placed_order();
+        let chosen = plan(&does, stage(), by_order, &mut None);
+        if does.iter().any(|d| matches!(d, Does::Placed { .. })) {
+            match (&chosen, by_order) {
+                (Err(BEHIND_PLACED), false) => crate::port_rt::count(crate::port_rt::REFUSED_OFF),
+                (Ok(_), true) if plan(&does, stage(), false, &mut None) == Err(BEHIND_PLACED) => {
+                    crate::port_rt::count(crate::port_rt::BY_ORDER)
+                }
+                _ => {}
+            }
+        }
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
